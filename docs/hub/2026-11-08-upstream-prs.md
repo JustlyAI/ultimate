@@ -45,12 +45,12 @@ I expect a clear-cut fix to a doc or a bug to have a fair chance of a merge. A c
 
 ## Summary
 
-| PR | Value to Hub | Value to Ultimate's users | Chance of a merge | Recommendation |
-| --- | --- | --- | --- | --- |
-| 1. Launcher and start time in `ultimate.lock` | Small | None | Low | Hold. Do not propose now. |
-| 2. Start flag that holds resumed work | None. Ultimate already does it. | None | Very low | Drop. |
-| 3. Find `claude` without `PATH` | None. Hub already sets `PATH`. | Small, and the code is in another repository | Very low | Drop for Ultimate. |
-| 4. README fix for pnpm 11 | None | Every new user | High | Propose. |
+| PR                                            | Value to Hub                    | Value to Ultimate's users                    | Chance of a merge | Recommendation            |
+| --------------------------------------------- | ------------------------------- | -------------------------------------------- | ----------------- | ------------------------- |
+| 1. Launcher and start time in `ultimate.lock` | Small                           | None                                         | Low               | Hold. Do not propose now. |
+| 2. Start flag that holds resumed work         | None. Ultimate already does it. | None                                         | Very low          | Drop.                     |
+| 3. Find `claude` without `PATH`               | None. Hub already sets `PATH`.  | Small, and the code is in another repository | Very low          | Drop for Ultimate.        |
+| 4. README fix for pnpm 11                     | None                            | Every new user                               | High              | Propose.                  |
 
 Each chance of a merge is a guess, based on the terms above.
 
@@ -76,11 +76,11 @@ The lock gets two fields:
 ```ts
 // ultimate.lock, written by bin/ultimate.ts
 type SupervisorLock = {
-	pid: number
-	port: number
-	project: string
-	node: string // process.execPath
-	entry: string // join(ultimateRoot, 'bin/ultimate.ts')
+  pid: number
+  port: number
+  project: string
+  node: string // process.execPath
+  entry: string // join(ultimateRoot, 'bin/ultimate.ts')
 }
 ```
 
