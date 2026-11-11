@@ -3,7 +3,14 @@ import { bool, num, obj, opt, str } from '@earendil-works/pi-schema'
 import { configure, defineTool, ROOT_CONVERSATION_ID } from '@earendil-works/pi-durable'
 import type { ConversationId } from '@earendil-works/pi-durable'
 import type { ExtensionHost } from '../../server/extensions.ts'
-import { definitionAgent, discoverAgents, hostDefaultModel, onFamily } from '../../lib/agents.ts'
+import {
+  definitionAgent,
+  definitionFamily,
+  discoverAgents,
+  hostDefault,
+  onFamily,
+} from '../../lib/agents.ts'
+import { Family } from '../models/api.ts'
 import { readFamilies } from '../../lib/families-settings.ts'
 import { LineageApi, Roots } from '../lineage/api.ts'
 import { actingAs } from '../../lib/acting-as.ts'
@@ -61,15 +68,17 @@ export const branchTool = (host: ExtensionHost) =>
                 host.modelRuntime.getAvailableSnapshot(),
               )
         // The model and thinking level the definition pins when its provider has a login here, thinking clamped to
-        // what the model supports; without one, the current default model, never the one the root last stored.
+        // what the model supports; without one, the current default model and thinking level, never what the root
+        // last stored.
         const rootAgent = await (await host
           .harness()
           .conversation(root as ConversationId, ctx))!.agent(ctx)
-        const { model, thinkingLevel, modelTools } = definitionAgent(
+        const change = definitionAgent(
           coordinator,
-          { ...rootAgent, model: await hostDefaultModel(host) },
+          { ...rootAgent, ...(await hostDefault(host)) },
           host.modelRuntime,
         )
+        const { model, thinkingLevel, modelTools } = change
         const branch = await lineage.branch(
           {
             from: root,
@@ -92,6 +101,7 @@ export const branchTool = (host: ExtensionHost) =>
             ...(modelTools && 'add' in modelTools && modelTools.add?.length ? { modelTools } : {}),
           })
           ;(await tx.doc(host.metadata, branch.id)).label = 'coordinator'
+          ;(await tx.doc(Family, branch.id)).name = definitionFamily(coordinator, change)
           const started = await tx.doc(Started, branch.id)
           started.by = from
           // An agent's request the starter still owes an answer (send.ts's test for what is owed) is what the branch
