@@ -16,12 +16,13 @@ import {
   held,
 } from './helpers.ts'
 import { context } from '../server/harness.ts'
-import { UiState } from '../server/ui-state.ts'
+import { UiState } from '../shared/ui-state.ts'
 import { Metadata } from '../server/metadata.ts'
 import type { ConversationSummary, ServerEvents } from '../shared/protocol.ts'
 import { Logins } from '../extensions/models/server.ts'
 import { fixture, orderedSource, servers } from './server-fixture.ts'
 import { eventHost } from './helpers.ts'
+import { writeSecret } from '../extensions/secrets/store.ts'
 import { UserInputEvent } from '../shared/events.ts'
 
 describe('server', () => {
@@ -248,11 +249,27 @@ export default host => {
     expect(() => previous('retired notice')).not.toThrow()
     const current = (await server.vite.ssrLoadModule(path)).raise as (message: string) => void
     current('current notice')
-    expect(server.extensions.info.diagnostics()).toContain('current notice')
-    expect(server.extensions.info.diagnostics()).not.toContain('retired notice')
+    expect(await server.extensions.info.diagnostics()).toContain('current notice')
+    expect(await server.extensions.info.diagnostics()).not.toContain('retired notice')
     servers.splice(servers.indexOf(server), 1)
     await server.close()
     expect(() => current('shutdown notice')).not.toThrow()
+  })
+
+  it('clears a missing-secret notice from the diagnostics once the secret is saved', async () => {
+    const { server, options } = await fixture(false, {
+      'needs-key': `import { defineExtension } from '@earendil-works/pi-durable'
+export default host => {
+  host.notice('Missing MY_KEY', { untilSecretSet: 'MY_KEY' })
+  return defineExtension({ name: 'needs-key' })
+}`,
+    })
+    await until(() => server.system.current().extensionDiagnostics.includes('Missing MY_KEY'))
+    expect(await server.extensions.info.diagnostics()).toContain('Missing MY_KEY')
+    await writeSecret(options.userHome, 'MY_KEY', 'value')
+    server.vite.watcher.emit('all', 'change', join(options.userHome, '.ultimate/secrets.json'))
+    await until(() => !server.system.current().extensionDiagnostics.includes('Missing MY_KEY'))
+    expect(await server.extensions.info.diagnostics()).not.toContain('Missing MY_KEY')
   })
 
   it('runs late facet openers immediately and continues after throwing cleanups', async () => {
@@ -456,7 +473,7 @@ export default host => { host.resource('cleanup.process',()=>{
     expect(JSON.stringify(events)).not.toContain('secret')
     await server.root.abort(context)
   })
-  it('appends a live-added section, orders tools, and plans nothing more after reopen', async () => {
+  it('orders live-added sections and tools deterministically across reopen', async () => {
     const { server, options } = await fixture(false, {
       a: orderedSource('a'),
       prompt: orderedSource('prompt', -100),
@@ -478,8 +495,7 @@ export default host => { host.resource('cleanup.process',()=>{
     const message = systems.at(-1)!.model![0]
     expect(message.role).toBe('system')
     if (message.role !== 'system') throw new Error('Expected system message')
-    // Appended by the pi-durable patch, not re-added with every other section in declared order.
-    expect(Object.keys(message.sections!)).toEqual(['new'])
+    expect(Object.keys(message.sections!)).toEqual(['prompt', 'new', 'a'])
     expect(message.toolsAdded!.map((tool) => tool.name)).toEqual(['prompt', 'new', 'a'])
     const lastId = systems.at(-1)!.id
     await server.vite.watcher.close()

@@ -1,8 +1,9 @@
+import type { Conversation, ConversationId } from '@earendil-works/pi-durable'
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
+import type { Message } from '@earendil-works/pi-ai'
 import { fauxAssistantMessage, fauxToolCall } from '@earendil-works/pi-ai/providers/faux'
 import { LiveDoc, ROOT_CONVERSATION_ID } from '@earendil-works/pi-durable'
-import type { Conversation, ConversationId } from '@earendil-works/pi-durable'
 import { afterAll, expect, it } from 'vitest'
 import { onCommit } from '../../../lib/commits.ts'
 import {
@@ -18,7 +19,7 @@ import type { ConversationSummary } from '../../../shared/protocol.ts'
 import { context } from '../../../server/harness.ts'
 import { Metadata } from '../../../server/metadata.ts'
 import { actions as conversationActions, concludedIn, setStanding } from '../server.ts'
-import { UiState } from '../../../server/ui-state.ts'
+import { UiState } from '../../../shared/ui-state.ts'
 import type { ExtensionHost } from '../../../server/extensions.ts'
 import { actionExec } from '../../../server/actions.ts'
 import { currentAnswer, exchangeUser } from '../summary.ts'
@@ -134,11 +135,10 @@ it.concurrent('tells each top-level conversation about the others in a fixed tex
   expect(child.inputAt).toEqual(expect.any(Number))
   expect(child.parentConversationId).toBe(root)
   expect(child.branchOf).toBeUndefined()
-  expect(await render('conversations', child.id as ConversationId)).toBeUndefined()
-  const childContext = await (await server.harness.conversation(
-    child.id as ConversationId,
+  expect(await render('conversations', child.id)).toBeUndefined()
+  const childContext = await (await server.harness.conversation(child.id, context))!.context(
     context,
-  ))!.context(context)
+  )
   const childNotes = childContext.entries.filter((entry) => entry.kind === 'conversations.identity')
   expect(childNotes).toHaveLength(1)
   expect(childNotes[0].model?.[0]).toMatchObject({ content: `You are conversation #${child.id}.` })
@@ -238,7 +238,11 @@ it.concurrent('renders identical system prompt sections and tools for a conversa
 
   // Audit the existing document exception: lineage.branch resets on raw forks.
   await server.harness.commit(async (tx) => {
-    ;(await tx.doc(Branch, id)).branch = { from: 1, at: at.id, intent: 'Branch work' }
+    ;(await tx.doc(Branch, id)).branch = {
+      from: 1 as ConversationId,
+      at: at.id,
+      intent: 'Branch work',
+    }
   }, context)
   const branchFork = await server.harness.commit(
     (tx) => tx.forkConversation(id, at.id, { ownership: { kind: 'ownerless' } }),
@@ -255,7 +259,11 @@ it.concurrent('renders identical system prompt sections and tools for a conversa
   expect(forked.sections.lineage).not.toContain('Branched from')
   // When the fork has the same branch facts, its entire prefix is identical too.
   await server.harness.commit(async (tx) => {
-    ;(await tx.doc(Branch, branchFork.id)).branch = { from: 1, at: at.id, intent: 'Branch work' }
+    ;(await tx.doc(Branch, branchFork.id)).branch = {
+      from: 1 as ConversationId,
+      at: at.id,
+      intent: 'Branch work',
+    }
   }, context)
   expect(JSON.stringify(await render(branchFork.id))).toBe(JSON.stringify(branchParent))
 })
@@ -265,7 +273,18 @@ const submit = async (target: Conversation, text: string) =>
 const notes = async (target: Conversation) =>
   (await target.context(context)).entries.filter((entry) => entry.kind === 'conversations.identity')
 
-it.concurrent('identifies first inputs and inputs after compaction, not other turns, durably across forks and reopening', async () => {
+/** A faux response that checks the request leads with the system message and then the identity, as the guard adds it. */
+const identifiedAfterSystem =
+  (id: ConversationId, text: string) => (request: { messages: Message[] }) => {
+    expect(request.messages[0].role).toBe('system')
+    expect(request.messages[1]).toMatchObject({
+      role: 'user',
+      content: `You are conversation #${id}.`,
+    })
+    return fauxAssistantMessage(text)
+  }
+
+it.concurrent('stores the identity at first inputs, durably across forks and reopening; after compaction or reset, requests carry it', async () => {
   const { server, create } = await launch()
   const id = await create()
   const conversation = (await server.harness.conversation(id, context))!
@@ -304,11 +323,14 @@ it.concurrent('identifies first inputs and inputs after compaction, not other tu
   await server.harness.waitForTask(await conversation.compact(undefined, context), context)
   const marker = await server.harness.commit((tx) => tx.latestHeadMarker(id), context)
   expect(marker?.kind).toBe('pi.compaction')
+  // From here the request guard identifies it, and nothing is stored: a copy behind the guard's would end it.
+  server.host.faux!.setResponses([
+    identifiedAfterSystem(id, 'After compaction answer'),
+    identifiedAfterSystem(id, 'After compaction second answer'),
+  ])
   await submit(conversation, 'After compaction')
-  expect((await notes(conversation)).at(-1)!.id).toBeGreaterThan(marker!.id)
-  const count = (await notes(conversation)).length
   await submit(conversation, 'After compaction second')
-  expect(await notes(conversation)).toHaveLength(count)
+  expect(await notes(conversation)).toHaveLength(0)
 
   const options = {
     ultimateRoot: server.host.ultimateRoot,
@@ -320,20 +342,19 @@ it.concurrent('identifies first inputs and inputs after compaction, not other tu
   servers.splice(servers.indexOf(server), 1)
   const reopened = await fauxServer(options)
   servers.push(reopened)
-  reopened.host.faux!.setResponses([fauxAssistantMessage('Reopened answer')])
+  reopened.host.faux!.setResponses([identifiedAfterSystem(id, 'Reopened answer')])
   const continued = (await reopened.harness.conversation(id, context))!
   await submit(continued, 'After reopening')
-  expect(await notes(continued)).toHaveLength(count)
-  // A reset loses context too, and the same durable marker mechanism refreshes the identity once.
+  expect(await notes(continued)).toHaveLength(0)
+  // A reset loses context too, and the guard identifies its requests the same way.
   await continued.reset(undefined, context)
   reopened.host.faux!.setResponses([
-    fauxAssistantMessage('Reset answer'),
-    fauxAssistantMessage('Next'),
+    identifiedAfterSystem(id, 'Reset answer'),
+    identifiedAfterSystem(id, 'Next'),
   ])
   await submit(continued, 'After reset')
-  expect(await notes(continued)).toHaveLength(1)
   await submit(continued, 'After reset second')
-  expect(await notes(continued)).toHaveLength(1)
+  expect(await notes(continued)).toHaveLength(0)
 })
 
 it.each(['compaction', 'reset'] as const)(
@@ -390,7 +411,8 @@ it.concurrent('identifies the next model request after automatic overflow compac
         model: [{ role: 'user', content: `Part ${n} ${'word '.repeat(4000)}`, timestamp: n }],
       })
   }, context)
-  let resumed = false
+  let resumed: Message[] | undefined
+  let next: Message[] | undefined
   server.host.faux!.setResponses([
     fauxAssistantMessage('Too long', {
       stopReason: 'error',
@@ -398,18 +420,26 @@ it.concurrent('identifies the next model request after automatic overflow compac
     }),
     fauxAssistantMessage('Summary without identity'),
     (request) => {
-      resumed = true
+      resumed = request.messages
       expect(JSON.stringify(request.messages)).toContain('Summary without identity')
-      expect(JSON.stringify(request.messages)).toContain(`You are conversation #${id}.`)
-      return fauxAssistantMessage('Resumed')
+      return identifiedAfterSystem(id, 'Resumed')(request)
+    },
+    (request) => {
+      next = request.messages
+      return fauxAssistantMessage('Next answer')
     },
   ])
   expect((await submit(conversation, 'Continue')).status).toBe('done')
-  expect(resumed).toBe(true)
+  expect(resumed).toBeDefined()
   const marker = await server.harness.commit((tx) => tx.latestHeadMarker(id), context)
   expect(marker?.kind).toBe('pi.compaction')
   expect(marker?.data).toMatchObject({ reason: 'overflow' })
   expect(await notes(conversation)).toHaveLength(0) // the request guard does not write history
+  // The next input stores no second identity: the guarded request is still the next one's prefix, so the provider
+  // reads it from the prompt cache instead of writing the whole conversation again.
+  await submit(conversation, 'Next')
+  expect(await notes(conversation)).toHaveLength(0)
+  expect(next!.slice(0, resumed!.length)).toEqual(resumed)
 })
 
 it.concurrent('renames top-level conversations', async () => {
@@ -581,7 +611,8 @@ it.concurrent('keeps unmarked Pi input history and makes no metadata writes on a
     })
     return opened
   }
-  const reopened = { ...prepared, ...(await prepared.go()) }
+  // go() returns the opened harness, whose close() would replace the server's and leave Vite watching the source copy.
+  const reopened = { ...prepared, ...(await prepared.go()), close: () => prepared.close() }
   servers.push(reopened)
   expect(reopened.api.conversations().find((item) => item.id === id)).toMatchObject({
     title: 'Existing parser work',

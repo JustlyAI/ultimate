@@ -1,5 +1,6 @@
+import type { EntryId } from '@earendil-works/pi-durable'
 import { expect, it } from 'vitest'
-import type { JsonValue } from '@earendil-works/chord'
+import type { JsonValue } from '@earendil-works/chord/json'
 import { actions } from '../server.ts'
 import type { ActionContext } from '../../../server/actions.ts'
 import type { ExtensionHost } from '../../../server/extensions.ts'
@@ -7,7 +8,7 @@ import type { EventRecord } from '../../../shared/events.ts'
 
 const T0 = Date.parse('2026-10-20T12:00:00Z')
 const event = (id: number, name: string, hours: number): EventRecord => ({
-  id,
+  id: id as EntryId,
   name,
   kind: `event.${name}`,
   v: 1,
