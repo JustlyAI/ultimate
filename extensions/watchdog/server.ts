@@ -1,3 +1,4 @@
+import { connect } from 'node:net'
 import { parseEntryId, offsetEntryId } from '../../lib/ids.ts'
 import type {
   ConversationId,
@@ -26,10 +27,50 @@ import { Standing, Subagents } from '../subagents/api.ts'
 import { WatchdogApi } from './api.ts'
 import type { ReportedFailure } from './api.ts'
 import type { Failure } from './refs.ts'
-import { FailureEntry } from './entries.ts'
+import { FailureEntry, OfflineEntry } from './entries.ts'
 
 const TEMPORARY_FAILURE_RETRY_DELAY_MS = 60_000
 export const FAILURE_LIMIT = 20
+export const NETWORK_WAIT_LIMIT_MS = 6 * 3_600_000
+const FIRST_PROBE_DELAY_MS = 30_000
+const LONGEST_PROBE_DELAY_MS = 600_000
+const PROBE_TIMEOUT_MS = 10_000
+const NETWORK_ERROR = /\b(ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|ENETUNREACH|EHOSTUNREACH)\b/
+
+type Endpoint = { host: string; port: number }
+
+export function unreachableEndpoint(
+  error: string,
+  baseUrl: () => string | undefined,
+): Endpoint | undefined {
+  if (!NETWORK_ERROR.test(error)) return undefined
+  const lookup = /getaddrinfo (?:ENOTFOUND|EAI_AGAIN) ([\w.-]+)/.exec(error)
+  if (lookup) return { host: lookup[1], port: 443 }
+  const socket = /connect E[A-Z]+ ([\w.:-]+?):(\d+)\b/.exec(error)
+  if (socket) return { host: socket[1], port: Number(socket[2]) }
+  if (error.startsWith('Incomplete Claude Code upstream response'))
+    return { host: 'api.anthropic.com', port: 443 }
+  const base = baseUrl()
+  const url = base ? URL.parse(base) : null
+  if (url?.protocol !== 'https:' && url?.protocol !== 'http:') return undefined
+  return {
+    host: url.hostname.replace(/^\[|\]$/g, ''),
+    port: Number(url.port) || (url.protocol === 'https:' ? 443 : 80),
+  }
+}
+
+export function reachable({ host, port }: Endpoint, signal?: AbortSignal) {
+  return new Promise<boolean>((resolve) => {
+    const socket = connect({ host, port, timeout: PROBE_TIMEOUT_MS, signal })
+    const settle = (connected: boolean) => {
+      socket.destroy()
+      resolve(connected)
+    }
+    socket.once('connect', () => settle(true))
+    socket.once('timeout', () => settle(false))
+    socket.once('error', () => settle(false))
+  })
+}
 
 const Reported = defineDoc<{ failures: ReportedFailure[] }>({
   kind: 'watchdog.reported',
@@ -185,14 +226,59 @@ async function details(tx: Tx, metadata: ExtensionHost['metadata'], task: Genera
 
 export default function watchdog(host: ExtensionHost) {
   const Watchdog = defineTask<
-    Failure & { failedTask: number; recipient: ConversationId; temporary: boolean; until: number },
-    { phase: 'wait' } | { phase: 'retry' } | { phase: 'report' },
+    Failure & {
+      failedTask: number
+      recipient: ConversationId
+      temporary: boolean
+      until: number
+      offline?: Endpoint & { since: number }
+    },
+    | { phase: 'probe'; waiting?: true }
+    | { phase: 'wait' }
+    | { phase: 'retry' }
+    | { phase: 'report'; offline?: true },
     null
   >({
     name: 'watchdog.failure',
     version: 1,
-    initial: (input) => ({ phase: input.temporary && !input.retried ? 'wait' : 'report' }),
+    initial: (input) => ({
+      phase: input.offline ? 'probe' : input.temporary && !input.retried ? 'wait' : 'report',
+    }),
     phases: {
+      probe: async (task, runtime, ctx) => {
+        const { offline, retried, temporary, conversation } = task.input
+        const { since, ...endpoint } = offline!
+        const waited = runtime.now() - since
+        if (waited >= NETWORK_WAIT_LIMIT_MS)
+          return runtime.commit(
+            () => ({ status: 'running', checkpoint: { phase: 'report', offline: true } }),
+            ctx,
+          )
+        if (await reachable(endpoint, runtime.signal)) {
+          const failedWhileReachable = !task.state.checkpoint.waiting && (retried || !temporary)
+          return runtime.commit(
+            () => ({
+              status: 'running',
+              checkpoint: { phase: failedWhileReachable ? 'report' : 'wait' },
+            }),
+            ctx,
+          )
+        }
+        await runtime.commit(async (tx) => {
+          if (!task.state.checkpoint.waiting)
+            await tx.appendEntry(conversation, {
+              kind: OfflineEntry.kind,
+              data: { host: endpoint.host, since },
+            })
+          return {
+            status: 'sleeping',
+            until:
+              runtime.now() +
+              Math.min(Math.max(waited, FIRST_PROBE_DELAY_MS), LONGEST_PROBE_DELAY_MS),
+            checkpoint: { phase: 'probe', waiting: true },
+          }
+        }, ctx)
+      },
       wait: (task, runtime, ctx) => runtime.sleepUntil(task.input.until, { phase: 'retry' }, ctx),
       retry: async (task, runtime, ctx) => {
         const { conversation, failedTask, error } = task.input
@@ -219,8 +305,10 @@ export default function watchdog(host: ExtensionHost) {
         await runtime.commit(() => terminal, ctx)
       },
       report: async (task, runtime, ctx) => {
-        const { conversation, title, error, step, hint, retried, failedTask, recipient } =
-          task.input
+        const { conversation, title, error, step, retried, failedTask, recipient } = task.input
+        const hint = task.state.checkpoint.offline
+          ? `${task.input.offline!.host} stayed unreachable for ${NETWORK_WAIT_LIMIT_MS / 3_600_000} h; once the network is back, resume this conversation with a message`
+          : task.input.hint
         const data: Failure = {
           conversation,
           title,
@@ -321,6 +409,16 @@ export default function watchdog(host: ExtensionHost) {
       if (task.state.status !== 'terminal' || task.state.outcome.status !== 'failed') return
       const error = task.state.outcome.error.message
       const { hint, temporary } = diagnose(error, info.assistant)
+      const endpoint =
+        hint || !info.assistant
+          ? undefined
+          : unreachableEndpoint(
+              error,
+              () =>
+                host.modelRuntime.getModel(info.assistant!.provider, info.assistant!.model)
+                  ?.baseUrl,
+            )
+      const failedAt = task.endedAt ?? Date.now()
       await tx.createTask(
         Watchdog,
         {
@@ -333,7 +431,8 @@ export default function watchdog(host: ExtensionHost) {
           ...(hint ? { hint } : {}),
           retried: runInputs.some((input) => input.requestId?.startsWith('watchdog-retry:')),
           temporary,
-          until: (task.endedAt ?? Date.now()) + TEMPORARY_FAILURE_RETRY_DELAY_MS,
+          until: failedAt + TEMPORARY_FAILURE_RETRY_DELAY_MS,
+          ...(endpoint ? { offline: { ...endpoint, since: failedAt } } : {}),
         },
         { conversationId: recipient, ownership: { kind: 'conversation' }, background: true },
       )

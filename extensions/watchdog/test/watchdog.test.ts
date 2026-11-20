@@ -25,8 +25,10 @@ import {
   MemoryStorage,
   ROOT_CONVERSATION_ID,
 } from '@earendil-works/pi-durable'
+import { createServer } from 'node:net'
+import type { AddressInfo } from 'node:net'
 import { afterEach, expect, it } from 'vitest'
-import watchdog, { diagnose } from '../server.ts'
+import watchdog, { diagnose, NETWORK_WAIT_LIMIT_MS, unreachableEndpoint } from '../server.ts'
 import type { WatchdogService } from '../api.ts'
 import { Messages } from '../../messages/api.ts'
 import { Standing, Subagents } from '../../subagents/api.ts'
@@ -90,6 +92,7 @@ async function fixture(
   const notices: string[] = []
   let service: WatchdogService | undefined
   const host = {
+    modelRuntime: models,
     implement: (_api: unknown, implementation: WatchdogService) => {
       service = implementation
     },
@@ -808,4 +811,92 @@ it.each([
 ] as const)('diagnoses %s', (text, temporary, hint) => {
   const message = error(text)
   expect(diagnose(text, message)).toEqual(hint ? { hint, temporary } : { temporary })
+})
+
+async function closedPort() {
+  const server = createServer().listen(0, '127.0.0.1')
+  await new Promise((resolve) => server.once('listening', resolve))
+  const { port } = server.address() as AddressInfo
+  await new Promise((resolve) => server.close(resolve))
+  return port
+}
+async function listen(port: number) {
+  const server = createServer((socket) => socket.destroy()).listen(port, '127.0.0.1')
+  await new Promise((resolve) => server.once('listening', resolve))
+  cleanups.push(() => new Promise((resolve) => server.close(() => resolve())))
+}
+const offline = (port: number) =>
+  `Incomplete Claude Code upstream response (status unknown, capture incomplete, relay failure Error: connect ECONNREFUSED 127.0.0.1:${port})`
+
+it('waits for an unreachable provider host, then continues the run without a failure card', async () => {
+  const port = await closedPort()
+  let online = false
+  const seen: string[] = []
+  const f = await fixture((transcript) => {
+    const text = inputText(transcript)
+    if (text !== 'fail' && !text.startsWith('Your previous run')) return fauxAssistantMessage('ok')
+    seen.push(text)
+    return online ? fauxAssistantMessage('recovered') : error(offline(port))
+  })
+  const branch = await f.conversation('Daily read')
+  await (await f.submit(branch, 'fail')).wait(context)
+  await f.sleeping()
+  expect((await f.entries(branch, 'watchdog.offline')).map((entry) => entry.data)).toEqual([
+    { host: '127.0.0.1', since: 1_000_000 },
+  ])
+  f.advance(3_600_000)
+  await f.sleeping()
+  await f.reopen()
+  online = true
+  await listen(port)
+  f.advance(600_000)
+  await until(async () => seen.length === 2)
+  await until(async () => (await f.tasks()).every((task) => task.state.status === 'terminal'))
+  expect(await f.entries()).toHaveLength(0)
+  expect(await f.entries(branch, 'watchdog.offline')).toHaveLength(1)
+  expect(f.notices).toEqual([])
+})
+
+it('reports a run whose provider host stays unreachable past the bound', async () => {
+  const port = await closedPort()
+  const f = await fixture((transcript) =>
+    inputText(transcript) === 'fail' ? error(offline(port)) : fauxAssistantMessage('ok'),
+  )
+  const branch = await f.conversation('Daily read')
+  await (await f.submit(branch, 'fail')).wait(context)
+  await f.sleeping()
+  f.advance(NETWORK_WAIT_LIMIT_MS)
+  await until(async () => (await f.entries()).length === 1)
+  expect((await f.entries())[0].data).toMatchObject({
+    conversation: branch,
+    retried: false,
+    hint: '127.0.0.1 stayed unreachable for 6 h; once the network is back, resume this conversation with a message',
+  })
+})
+
+// Real errors from failed runs, and the host watchdog waits for.
+it.each([
+  [
+    'Incomplete Claude Code upstream response (status unknown, capture incomplete, relay failure Error: getaddrinfo ENOTFOUND api.anthropic.com)',
+    { host: 'api.anthropic.com', port: 443 },
+  ],
+  [
+    'Incomplete Claude Code upstream response (status unknown, capture incomplete, relay failure Error: read ECONNRESET)',
+    { host: 'api.anthropic.com', port: 443 },
+  ],
+  [
+    'request to https://example.test/v1 failed, reason: read ECONNRESET',
+    { host: 'example.test', port: 443 },
+  ],
+  [
+    'Incomplete Claude Code upstream response (status unknown, capture incomplete, relay failure Error)',
+    undefined,
+  ],
+  ['invalid model configuration', undefined],
+  [
+    'Incomplete Claude Code upstream response (status 401, capture incomplete, upstream said: invalid x-api-key)',
+    undefined,
+  ],
+] as const)('finds the unreachable host of %s', (text, endpoint) => {
+  expect(unreachableEndpoint(text, () => 'https://example.test/v1')).toEqual(endpoint)
 })

@@ -1,5 +1,7 @@
-/** Watchdog failure cards: the failed conversation, error, last step and retry outcome. */
+/** Watchdog entries: failure cards, and the note that a run waits for its provider's host to be reachable again. */
 import type { ConversationId } from '@earendil-works/pi-durable'
+/** A failed run's provider host was unreachable at `since` (epoch ms); the run continues once it is reachable. */
+export type Offline = { host: string; since: number }
 export type Failure = {
   conversation: ConversationId
   title: string

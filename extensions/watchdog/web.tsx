@@ -1,8 +1,8 @@
-import { AlertCircleIcon } from 'lucide-react'
+import { AlertCircleIcon, WifiOffIcon } from 'lucide-react'
 import { defineWebExtension, renderEntry, useUltimate } from '@/sdk'
 import { MessageResponse } from '@/components/ai/message'
 import { ConversationRef } from '../conversations/ui.tsx'
-import { FailureEntry, IdleEntry } from './entries.ts'
+import { FailureEntry, IdleEntry, OfflineEntry } from './entries.ts'
 
 export default defineWebExtension({
   entries: {
@@ -33,6 +33,12 @@ export default defineWebExtension({
         </section>
       )
     }),
+    'watchdog.offline': renderEntry(OfflineEntry, ({ entry }) => (
+      <p className="flex items-center gap-1.5 font-mono text-[11px] text-muted-foreground">
+        <WifiOffIcon className="size-3.5" />
+        waiting for network: {entry.data.host} unreachable; continues once it is back
+      </p>
+    )),
     'watchdog.idle': renderEntry(IdleEntry, ({ entry }) => (
       <p className="whitespace-pre-line font-mono text-[11px] text-muted-foreground">
         {entry.data.text}
