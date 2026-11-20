@@ -44,19 +44,18 @@ export function unreachableEndpoint(
   baseUrl: () => string | undefined,
 ): Endpoint | undefined {
   if (!NETWORK_ERROR.test(error)) return undefined
-  const lookup = /getaddrinfo (?:ENOTFOUND|EAI_AGAIN) ([\w.-]+)/.exec(error)
-  if (lookup) return { host: lookup[1], port: 443 }
-  const socket = /connect E[A-Z]+ ([\w.:-]+?):(\d+)\b/.exec(error)
+  const socket = /connect E[A-Z]+ (\S+):(\d+)/.exec(error)
   if (socket) return { host: socket[1], port: Number(socket[2]) }
-  if (error.startsWith('Incomplete Claude Code upstream response'))
-    return { host: 'api.anthropic.com', port: 443 }
   const base = baseUrl()
   const url = base ? URL.parse(base) : null
-  if (url?.protocol !== 'https:' && url?.protocol !== 'http:') return undefined
-  return {
-    host: url.hostname.replace(/^\[|\]$/g, ''),
-    port: Number(url.port) || (url.protocol === 'https:' ? 443 : 80),
-  }
+  if (url?.protocol === 'https:' || url?.protocol === 'http:')
+    return {
+      host: url.hostname.replace(/^\[|\]$/g, ''),
+      port: Number(url.port) || (url.protocol === 'https:' ? 443 : 80),
+    }
+  if (error.startsWith('Incomplete Claude Code upstream response'))
+    return { host: 'api.anthropic.com', port: 443 }
+  return undefined
 }
 
 export function reachable({ host, port }: Endpoint, signal?: AbortSignal) {
@@ -246,7 +245,7 @@ export default function watchdog(host: ExtensionHost) {
     }),
     phases: {
       probe: async (task, runtime, ctx) => {
-        const { offline, retried, temporary, conversation } = task.input
+        const { offline, retried, conversation } = task.input
         const { since, ...endpoint } = offline!
         const waited = runtime.now() - since
         if (waited >= NETWORK_WAIT_LIMIT_MS)
@@ -255,7 +254,7 @@ export default function watchdog(host: ExtensionHost) {
             ctx,
           )
         if (await reachable(endpoint, runtime.signal)) {
-          const failedWhileReachable = !task.state.checkpoint.waiting && (retried || !temporary)
+          const failedWhileReachable = retried && !task.state.checkpoint.waiting
           return runtime.commit(
             () => ({
               status: 'running',

@@ -880,6 +880,8 @@ it.each([
     'Incomplete Claude Code upstream response (status unknown, capture incomplete, relay failure Error: getaddrinfo ENOTFOUND api.anthropic.com)',
     { host: 'api.anthropic.com', port: 443 },
   ],
+  ['getaddrinfo ENOTFOUND example.test', { host: 'example.test', port: 8443 }],
+  ['connect ECONNREFUSED ::1:11434', { host: '::1', port: 11434 }],
   [
     'Incomplete Claude Code upstream response (status unknown, capture incomplete, relay failure Error: read ECONNRESET)',
     { host: 'api.anthropic.com', port: 443 },
@@ -898,5 +900,8 @@ it.each([
     undefined,
   ],
 ] as const)('finds the unreachable host of %s', (text, endpoint) => {
-  expect(unreachableEndpoint(text, () => 'https://example.test/v1')).toEqual(endpoint)
+  const base = text.startsWith('Incomplete') ? 'process://claude-code' : 'https://example.test'
+  expect(
+    unreachableEndpoint(text, () => (text.startsWith('getaddrinfo') ? `${base}:8443` : base)),
+  ).toEqual(endpoint)
 })
