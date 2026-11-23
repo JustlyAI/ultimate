@@ -9,7 +9,8 @@ type Comment = { type: string; value: string; start: number; end: number }
 
 /** Run one rule over `source` as oxlint would for `file` (repository-relative): parse, walk, report full messages. */
 function diagnose(rule: Rule, file: string, source: string) {
-  const { program, comments } = parseSync(file, source, { lang: 'ts' }) as unknown as {
+  const lang = file.endsWith('.tsx') ? 'tsx' : 'ts'
+  const { program, comments } = parseSync(file, source, { lang }) as unknown as {
     program: Located
     comments: Comment[]
   }
@@ -38,19 +39,101 @@ function diagnose(rule: Rule, file: string, source: string) {
     },
     report: ({ message }) => reports.push(message),
   }) as Record<string, ((node: Located) => void) | undefined>
-  const visit = (node: Located, parent?: Located) => {
+  const children = (node: Located) =>
+    Object.entries(node).flatMap(([key, value]) =>
+      key === 'parent'
+        ? []
+        : (Array.isArray(value) ? value : [value]).filter(
+            (child): child is Located =>
+              !!child && typeof child === 'object' && typeof child.type === 'string',
+          ),
+    )
+  const link = (node: Located, parent?: Located) => {
     node.parent = parent
-    visitors[node.type]?.(node)
-    for (const [key, value] of Object.entries(node)) {
-      if (key === 'parent') continue
-      for (const child of Array.isArray(value) ? value : [value])
-        if (child && typeof child === 'object' && typeof child.type === 'string')
-          visit(child as Located, node)
-    }
+    for (const child of children(node)) link(child, node)
   }
+  const visit = (node: Located) => {
+    visitors[node.type]?.(node)
+    for (const child of children(node)) visit(child)
+  }
+  link(program)
   visit(program)
   return reports
 }
+
+it('rejects hand-rolled polls of Ultimate and raw requests to /api, as extensions shipped them, and leaves other servers alone', () => {
+  const polls = (file: string, source: string) =>
+    diagnose('no-raw-stream', file, source).filter((message) =>
+      message.includes('polls once per page'),
+    )
+  const sdk = "import { api, useAction } from '@/sdk/solid'\n"
+  // extensions/status-line/status.solid.tsx at 54fadf9: its own 1 s loop.
+  const rates = `${sdk}
+    const poll = async () => {
+      const next = await api.action(RatesAction, null, { signal: own.signal }).catch(() => null)
+      cancel = retryAfter(1000, () => void poll())
+    }`
+  expect(polls('extensions/status-line/status.solid.tsx', rates)).toHaveLength(1)
+  // extensions/automations/live.solid.tsx at 54fadf9: a refresh helper behind two timers.
+  const automations = `${sdk}
+    export const refreshList = () => refreshAutomations(api.action)
+    export function useLive() {
+      const refresh = () => void refreshList()
+      createEffect(signature, (_, previous) => (previous === undefined ? undefined : retryAfter(100, refresh)))
+      createEffect(late, (on) => {
+        refresh()
+        return every(2000, refresh)
+      })
+    }`
+  expect(polls('extensions/automations/live.solid.tsx', automations)).toHaveLength(2)
+  // extensions/mcp/chip.solid.tsx at 54fadf9: a refetch at each server's retry time beside useAction's every.
+  const mcp = `${sdk}
+    const { data: servers, refetch } = useAction(StatusAction, null, { every: settling })
+    const refresh = () => void refetch()
+    createEffect(retryAt, (at) => retryAfter(Math.max(0, at - Date.now()) + 500, refresh))`
+  expect(polls('extensions/mcp/chip.solid.tsx', mcp)).toHaveLength(1)
+  // extensions/system/surface.solid.tsx at 54fadf9: the lanes loaded every 2 s by hand.
+  const lanes = `${sdk}
+    const load = () => {
+      void api.action(LanesAction, { since }, { signal: controller.signal }).then(
+        (data) => setState({ range, data }),
+        (error) => setState({ range, error }),
+      )
+    }
+    load()
+    const stop = live ? every(2000, load) : undefined`
+  expect(polls('extensions/system/surface.solid.tsx', lanes)).toHaveLength(1)
+
+  const aliased = `import { api as backend } from '@/sdk/solid'
+    every(2000, () => void backend.action(ListAction).then(show))`
+  expect(polls('extensions/mine/web.solid.tsx', aliased)).toHaveLength(1)
+  const otherLibrary = `import { useAction } from 'some-query-library'
+    const { refetch } = useAction('items')
+    every(5000, () => void refetch())`
+  expect(polls('extensions/mine/web.solid.tsx', otherLibrary)).toEqual([])
+  const others = `${sdk}
+    import { client } from './my-backend.ts'
+    const query = useQuery()
+    every(5000, () => void client.action('sync'))
+    every(pollMs, () => void query.refetch())
+    retryAfter(1000, () => setNow(Date.now()))
+    every(10_000, () => api.action(PresentAction, { endpoint, visible: true }).catch(warn))`
+  expect(polls('extensions/mine/web.solid.tsx', others)).toEqual([])
+
+  const raw = `
+    fetch('/api/extensions/mine/actions/list')
+    fetch(\`/api/events/\${id}\`)
+    new EventSource('/api/events')
+    fetch('https://api.example.com/v1/items')
+    fetch(\`\${backend}/items\`)
+    new WebSocket('wss://example.com/live')
+    every(1000, () => setNow(Date.now()))`
+  expect(diagnose('no-raw-stream', 'extensions/mine/web.solid.tsx', raw)).toEqual(
+    Array.from({ length: 3 }, () =>
+      expect.stringMatching(/not fetch or a socket of your own to \/api/),
+    ),
+  )
+})
 
 /** The specific part of each message, after the sentence that says why the rule exists. */
 const lint = (rule: Rule, file: string, source: string) =>
@@ -75,8 +158,8 @@ it('opens every contract and boundary message with why the rule exists', () => {
   expect(
     why(
       'core-tier-deps',
-      'extensions/conversations/rows.tsx',
-      "import { x } from '../plan/ui.tsx'",
+      'extensions/conversations/rows.solid.tsx',
+      "import { x } from '../plan/ui.solid.tsx'",
     ),
   ).toEqual(['The core tier must run with every optional extension off.'])
 })
@@ -214,18 +297,18 @@ export const limit = 3
   ).toEqual(["extensions/echo refers only to its own actions: actionRef('echo', name)."])
 })
 
-it('asks ui.tsx for a summary and nothing else', () => {
+it('asks ui.solid.tsx for a summary and nothing else', () => {
   expect(
     lint(
       'api-file-shape',
-      'extensions/echo/ui.tsx',
+      'extensions/echo/ui.solid.tsx',
       "/** Echo's components for other extensions: the echo line. */\nexport { EchoLine } from './line.tsx'\nexport const x = 1\n",
     ),
   ).toEqual([])
   expect(
-    lint('api-file-shape', 'extensions/echo/ui.tsx', "export { EchoLine } from './line.tsx'"),
+    lint('api-file-shape', 'extensions/echo/ui.solid.tsx', "export { EchoLine } from './line.tsx'"),
   ).toEqual([
-    'Start ui.tsx with a doc comment on what it offers; its first sentence is the one-line summary.',
+    'Start ui.solid.tsx with a doc comment on what it offers; its first sentence is the one-line summary.',
   ])
 })
 
@@ -275,24 +358,139 @@ const later = () => import('../questions/server.ts')`
 })
 
 const browserMessage = (file: string) =>
-  `echo imports ${file} at runtime; reach ${file.split('/')[0]} through its ui.tsx (components, hooks and the refs of its documents and actions), import types with \`import type\`, or move a pure helper to lib/.`
+  `echo imports ${file} at runtime; reach ${file.split('/')[0]} through its refs.ts (the refs of its documents and actions) or its ui.solid.tsx (its components, hooks and points), import types with \`import type\`, or move a pure helper to lib/.`
 
-it("allows browser code another extension's ui.tsx at runtime and its api.ts or refs.ts only for types", () => {
-  const source = `import { ConversationRef, OverviewDoc } from '../conversations/ui.tsx'
+it('lets browser code reach another extension through its refs.ts or ui.solid.tsx, and its api.ts only for types', () => {
+  const source = `import { ConversationRef } from '../conversations/ui.solid.tsx'
+import { OverviewDoc } from '../conversations/refs.ts'
+import { UnderUltimate } from '../sidebar/ui.solid.tsx'
 import type { WorkspaceService } from '../workspaces/api.ts'
-import type { MessagesData } from '../messages/refs.ts'
-import type { Plan } from '../plan/web.tsx'
+import type { Plan } from '../plan/web.solid.tsx'
 import { LogDoc } from './refs.ts'
-import { useWorkspaces } from '../workspaces/data.tsx'
+import { useWorkspaces } from '../workspaces/data.solid.tsx'
 import { WorkspacesApi } from '../workspaces/api.ts'
-import { MessagesDoc } from '../messages/refs.ts'
-export { TaskChip } from '../plan/chip.tsx'`
-  expect(lint('api-only-imports', 'extensions/echo/web.tsx', source)).toEqual([
-    browserMessage('workspaces/data.tsx'),
+export { TaskChip } from '../plan/chip.solid.tsx'`
+  expect(lint('api-only-imports', 'extensions/echo/web.solid.tsx', source)).toEqual([
+    browserMessage('workspaces/data.solid.tsx'),
     browserMessage('workspaces/api.ts'),
-    browserMessage('messages/refs.ts'),
-    browserMessage('plan/chip.tsx'),
+    browserMessage('plan/chip.solid.tsx'),
   ])
+  const project = `import { BoardDoc } from '../board/refs.ts'
+import { columns } from '../board/columns.ts'`
+  expect(lint('api-only-imports', '.ultimate/extensions/echo/status.solid.tsx', project)).toEqual([
+    browserMessage('board/columns.ts'),
+  ])
+})
+
+it('sends a Solid form to the kit Form, whose submit Button keeps who submitted it', () => {
+  const source = `export const Add = () => (
+  <form onSubmit={(event) => event.preventDefault()}>
+    <Form />
+  </form>
+)`
+  expect(lint('ui-kit-roles', 'extensions/todos/panel.solid.tsx', source)).toEqual([
+    `Use the kit's Form from @/components/ui and start the change in its type="submit" Button's onClick, which Enter in a field presses too.`,
+  ])
+  expect(lint('ui-kit-roles', 'web/src/components/ui/form.solid.tsx', source)).toEqual([])
+})
+
+it('sends a Solid bare button to the kit Button, which the agent bridge can see and press', () => {
+  const source = `export const Open = () => (
+  <button onClick={() => switchConversation(42)} type="button">
+    #42
+  </button>
+)`
+  expect(lint('ui-kit-roles', 'extensions/instance/link.solid.tsx', source)).toHaveLength(1)
+  expect(lint('ui-kit-roles', 'extensions/instance/test/link.test.solid.tsx', source)).toEqual([])
+  expect(lint('ui-kit-roles', 'web/src/components/ui/button.solid.tsx', source)).toEqual([])
+})
+
+it('rejects a pressed Button because the agent cannot read its state', () => {
+  const source = `import { Button } from '@/components/ui/button.solid.tsx'
+export const Fast = () => <Button aria-pressed={state().on ? 'true' : 'false'}>Fast mode</Button>`
+  const check = (code: string) =>
+    diagnose('no-aria-pressed-button', 'extensions/fast/toggle.solid.tsx', code)
+  const message =
+    'The agent bridge sees only press on a Button, never its pressed state. Use Toggle from @/components/ui/toggle.solid.tsx, or SegmentedControl or Tabs for a one-of-many selection.'
+  expect(check(source)).toEqual([message])
+  expect(
+    check(`import { Toggle } from '@/components/ui/toggle.solid.tsx'
+export const Fast = () => <Toggle pressed={state().on}>Fast mode</Toggle>`),
+  ).toEqual([])
+  expect(
+    check(`import { Button as Action } from '@/components/ui/button.solid.tsx'
+import { TooltipTrigger } from '@/components/ui/tooltip.solid.tsx'
+import { PopoverTrigger } from '@/components/ui/popover.solid.tsx'
+export const Fast = () => <>
+  <TooltipTrigger aria-pressed="true" render={(trigger) => <Action {...trigger} />} />
+  <PopoverTrigger aria-pressed="true" render={Action} />
+  <TooltipTrigger aria-pressed="true" />
+  <Action>Run</Action>
+</>`),
+  ).toEqual([message, message])
+})
+
+it('keeps server helpers out of web tests, which the web tsconfig type-checks', () => {
+  const source = `import { until } from '../../../../test/helpers.ts'
+import { renderSolid } from '../../../../test/web/solid-dom-setup.ts'`
+  expect(
+    lint(
+      'no-server-helpers-in-web-tests',
+      'extensions/fast/test/web/toggle.test.solid.tsx',
+      source,
+    ),
+  ).toHaveLength(1)
+})
+
+it('keeps ui-sdk components behind the UI kit', () => {
+  const source = `import { Switch } from '@ui-sdk/solid/switch'
+import { createSignal } from 'solid-js'
+import { useDoc } from '@/sdk/solid'
+import { Button } from '@/components/ui/button.solid.tsx'`
+  const message =
+    'Import the component from @/components/ui; for a behavior the kit lacks, compose it with definePrimitive from @ui-sdk/core.'
+  for (const file of [
+    'extensions/echo/panel.solid.tsx',
+    'web/src/app/panel.solid.tsx',
+    '../my-app/.ultimate/extensions/echo/web.solid.tsx',
+  ])
+    expect(lint('ui-framework-boundaries', file, source)).toEqual([message])
+  expect(lint('ui-framework-boundaries', 'web/src/components/ui/switch.solid.tsx', source)).toEqual(
+    [],
+  )
+})
+
+it('lets only the core hosts in web/src import the contribution bridge', () => {
+  const source = `import { Contribution } from '@/sdk/contribution.solid.tsx'
+const later = import(\`@/sdk/contribution.solid\`)`
+  const onePath =
+    "Hosts render every contribution through one path, with its extension scope and error isolation. Only the core hosts in web/src import the bridge (web/src/sdk/contribution.solid.tsx); an extension renders another's contribution with Contribution, Provided or Slot from @/sdk/solid."
+  for (const file of ['web/src/app/transcript.solid.tsx', 'web/src/sdk/parts.solid.tsx'])
+    expect(diagnose('ui-framework-boundaries', file, source)).toEqual([])
+  expect(diagnose('ui-framework-boundaries', 'extensions/echo/panel.solid.tsx', source)).toEqual([
+    onePath,
+    onePath,
+  ])
+})
+
+it('sends hand-made widget roles to the UI kit, outside the kit itself', () => {
+  const source = `export const List = () => (
+  <div role="listbox">
+    <span role="option" />
+    <span role="switch" />
+    <span role={'slider'} />
+    <span role={\`tab\`} />
+    <span role={dynamic} />
+    <span role={\`\${kind}\`} />
+  </div>
+)`
+  expect(lint('ui-kit-roles', 'extensions/echo/list.solid.tsx', source)).toEqual([
+    "Use the kit's Listbox or Select from @/components/ui.",
+    "Use the kit's Switch from @/components/ui.",
+    "Use the kit's Slider from @/components/ui.",
+    "Use the kit's Tabs from @/components/ui.",
+  ])
+  expect(lint('ui-kit-roles', 'web/src/components/ui/listbox.solid.tsx', source)).toEqual([])
 })
 
 const coreMessage = (optional: string) =>
@@ -306,14 +504,14 @@ import { usePhase } from '../phase/ui.tsx'
 import type { TaskLink } from '../plan/refs.ts'
 export { TaskChip } from '../plan/ui.tsx'
 import { git } from '../../lib/git.ts'
-const later = () => import('../questions/web.tsx')`
+const later = () => import('../questions/web.solid.tsx')`
   expect(lint('core-tier-deps', 'extensions/conversations/rows.tsx', source)).toEqual([
     coreMessage('phase'),
     coreMessage('plan'),
     coreMessage('plan'),
     coreMessage('questions'),
   ])
-  expect(lint('core-tier-deps', 'extensions/phase/web.tsx', source)).toEqual([])
+  expect(lint('core-tier-deps', 'extensions/phase/web.solid.tsx', source)).toEqual([])
   expect(lint('core-tier-deps', 'test/example.test.ts', source)).toEqual([])
 })
 
@@ -347,4 +545,21 @@ export type AbstractData = {
 MIT License — Copyright (c) 2025 Mario Zechner
 */`
   expect(lint('no-comments', 'extensions/entries/refs.ts', contract)).toEqual([])
+})
+
+it('keeps Solid SDK contract JSDoc on the entry and on the exports it re-exports', () => {
+  const entry = `/** The extension SDK for Solid facets. */
+/** A card that folds. */
+export { Fold } from '../app/fold.solid.tsx'`
+  expect(lint('no-comments', 'web/src/sdk/solid.ts', entry)).toEqual([])
+  const hooks = `/** Reads the document as an accessor. */
+export function useDoc() {}
+/** Shell navigation. */
+export const { switchConversation } = actions
+/** Keyed per conversation and kind. */
+export const replicaKey = (kind: string) => kind`
+  expect(lint('no-comments', 'web/src/sdk/hooks.ts', hooks)).toHaveLength(1)
+  const parts = `/** Renders a slot by name. */
+export function Slot() {}`
+  expect(lint('no-comments', 'web/src/sdk/parts.solid.tsx', parts)).toEqual([])
 })

@@ -1,12 +1,10 @@
 import type { ConversationId, TaskId } from '@earendil-works/pi-durable'
 import type { ModelThinkingLevel } from '@earendil-works/pi-ai'
-import type { Serves } from '../entries/refs.ts'
 
 type Milliseconds = number
 type CreateIdempotencyKey = string
 type StandingAgentName = string
 type ConsecutiveUnplannedExits = number
-type FirstFireRequest = Serves & { by: ConversationId }
 export type TriggerEvent = { name: string; description: string; fields: Record<string, string> }
 export const RunLabel = 'automation'
 export const WatcherLabel = 'watcher'
@@ -44,6 +42,7 @@ export type Automation = {
     idleFor?: Milliseconds
     inputAt?: Milliseconds
     firedAt?: number
+    waker?: TaskId
   }
   recentFires?: number[]
   script?: {
@@ -66,7 +65,6 @@ export type Automation = {
   model?: { provider: string; modelId: string }
   thinking?: ModelThinkingLevel
   subscribers: Subscriber[]
-  serves?: FirstFireRequest
   branches?: { ids: ConversationId[]; by: ConversationId }
   nextAt?: number
   scheduler?: TaskId

@@ -1,10 +1,12 @@
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, statSync } from 'node:fs'
+import { webModule } from '../lib/web-alias.ts'
 import path from 'node:path'
 import { apiSummary } from '../lib/api-files.ts'
 import { coreTier } from '../shared/extension-api.ts'
 
 interface ImportNode {
-  source?: { value?: unknown }
+  type?: string
+  source?: Node
   importKind?: string
   exportKind?: string
 }
@@ -15,7 +17,7 @@ interface Node {
   end?: number
   name?: string
   id?: Node
-  specifiers?: { type?: string; imported?: Node; exported?: Node }[]
+  specifiers?: { type?: string; imported?: Node; exported?: Node; local?: Node }[]
   source?: Node
   value?: unknown
   computed?: boolean
@@ -34,6 +36,8 @@ interface Node {
   kind?: string
   declaration?: Node | null
   declarations?: Node[]
+  expression?: Node
+  operator?: string
   init?: Node | null
   typeArguments?: Node | null
   params?: Node[]
@@ -63,7 +67,8 @@ interface Comment {
 }
 
 const extensionOf = (filename: string) => {
-  const [directory, extension] = path.relative(process.cwd(), filename).split(path.sep)
+  const parts = path.relative(process.cwd(), filename).split(path.sep)
+  const [directory, extension] = parts[0] === '.ultimate' ? parts.slice(1) : parts
   return directory === 'extensions' ? extension : undefined
 }
 /** The repository-relative path segments an import `source` of `filename` resolves to. */
@@ -71,9 +76,9 @@ const resolved = (filename: string, source: string) =>
   path.relative(process.cwd(), path.resolve(path.dirname(filename), source)).split(path.sep)
 /**
  * An extension's contract files: `api.ts` for server code, `refs.ts` for the documents and actions the browser reads
- * and calls, `ui.tsx` for what other extensions' browser code imports.
+ * and calls, and `ui.solid.tsx` for what other extensions' browser code imports.
  */
-const contracts = ['api.ts', 'refs.ts', 'ui.tsx'] as const
+const contracts = ['api.ts', 'refs.ts', 'ui.solid.tsx'] as const
 type Contract = (typeof contracts)[number]
 /** `extensions/<name>/<contract>`: the extension and which contract file it is. */
 const contractFile = (filename: string) => {
@@ -103,6 +108,51 @@ const membersOf = (declaration: Node): Node[] =>
   declaration.type === 'TSInterfaceDeclaration'
     ? (((declaration.body as Node | undefined)?.body as Node[] | undefined) ?? [])
     : literals(declaration.typeAnnotation)
+const repositoryPath = (filename: string) =>
+  path.relative(process.cwd(), filename).split(path.sep).join('/')
+const solidFile = (filename: string) => filename.endsWith('.solid.tsx')
+const bridgeFile = 'web/src/sdk/contribution.solid.tsx'
+const sdkEntries = ['web/src/sdk/solid.ts']
+const uiKitFile = (filename: string) =>
+  repositoryPath(filename).startsWith('web/src/components/ui/')
+const uiSdkComponents = /^@ui-sdk\/solid(\/|$)/
+const moduleSuffixes = ['', '.ts', '.tsx', '/index.ts', '/index.tsx']
+const localModule = (filename: string, source: string) => {
+  const base = source.startsWith('@/')
+    ? webModule(process.cwd(), source)
+    : source.startsWith('.')
+      ? path.resolve(path.dirname(filename), source)
+      : undefined
+  if (base === undefined) return undefined
+  const found = moduleSuffixes
+    .map((suffix) => base + suffix)
+    .find((file) => existsSync(file) && statSync(file).isFile())
+  return found ?? base
+}
+const staticString = (value: Node | null | undefined): unknown =>
+  value?.type === 'JSXExpressionContainer'
+    ? staticString(value.expression)
+    : value?.type === 'TemplateLiteral' &&
+        (value as { expressions?: unknown[] }).expressions?.length === 0
+      ? (value as { quasis?: { value?: { cooked?: string } }[] }).quasis?.[0]?.value?.cooked
+      : value?.value
+const kitRoles = new Map([
+  ['listbox', 'Listbox or Select'],
+  ['menu', 'Menu'],
+  ['menubar', 'Menubar'],
+  ['dialog', 'Dialog'],
+  ['alertdialog', 'AlertDialog'],
+  ['tablist', 'Tabs'],
+  ['tab', 'Tabs'],
+  ['separator', 'Separator'],
+  ['switch', 'Switch'],
+  ['slider', 'Slider'],
+  ['radiogroup', 'Radio'],
+  ['toolbar', 'Toolbar'],
+  ['tree', 'Tree'],
+  ['combobox', 'Combobox'],
+  ['tooltip', 'Tooltip'],
+])
 const onlyDefineEntry = (node: Node) =>
   node.source?.value === '@earendil-works/pi-durable' &&
   node.specifiers?.length === 1 &&
@@ -157,25 +207,35 @@ const isGlobal = (node: Node | undefined, name: string) =>
       ['window', 'globalThis'].includes(node.object.name ?? '') &&
       propertyName(node) === name
 
+function walk(node: Node, visit: (node: Node) => void) {
+  visit(node)
+  for (const [key, value] of Object.entries(node)) {
+    if (key === 'parent') continue
+    for (const child of Array.isArray(value) ? value : [value])
+      if (child && typeof child === 'object' && typeof (child as Node).type === 'string')
+        walk(child as Node, visit)
+  }
+}
+
 const isJsDoc = (comment: Comment) => comment.type === 'Block' && comment.value.startsWith('*')
-const inSdk = (filename: string) =>
-  path.relative(process.cwd(), filename).startsWith(`web${path.sep}src${path.sep}sdk${path.sep}`)
+const inSdk = (filename: string) => repositoryPath(filename).startsWith('web/src/sdk/')
 let sdkExports: Set<string> | undefined
-/** The names `web/src/sdk/index.ts` exports: the SDK's public surface, read once per lint process. */
 function publicSdk() {
   sdkExports ??= new Set(
-    [
-      ...readFileSync(path.join(process.cwd(), 'web/src/sdk/index.ts'), 'utf8').matchAll(
-        /export\s+(?:type\s+)?\{([^}]*)\}/g,
+    sdkEntries
+      .flatMap((entry) => [
+        ...readFileSync(path.join(process.cwd(), entry), 'utf8').matchAll(
+          /export\s+(?:type\s+)?\{([^}]*)\}/g,
+        ),
+      ])
+      .flatMap((match) =>
+        match[1].split(',').map((name) =>
+          name
+            .trim()
+            .split(/\s+as\s+/)
+            .pop()!,
+        ),
       ),
-    ].flatMap((match) =>
-      match[1].split(',').map((name) =>
-        name
-          .trim()
-          .split(/\s+as\s+/)
-          .pop()!,
-      ),
-    ),
   )
   return sdkExports
 }
@@ -185,7 +245,13 @@ const exportedNames = (statement: Node): string[] => {
   if (!declaration)
     return (statement.specifiers ?? []).map((specifier) => String(specifier.exported?.name))
   if (declaration.type === 'VariableDeclaration')
-    return (declaration.declarations ?? []).map((declarator) => String(declarator.id?.name))
+    return (declaration.declarations ?? []).flatMap(({ id }) =>
+      id?.type === 'ObjectPattern'
+        ? (id.properties ?? []).map((property) =>
+            String((property.value as Node | undefined)?.name),
+          )
+        : [String(id?.name)],
+    )
   return [String(declaration.id?.name)]
 }
 const functionTypes = ['FunctionDeclaration', 'ArrowFunctionExpression', 'FunctionExpression']
@@ -195,7 +261,8 @@ const hasBody = (statement: Node) =>
   (statement.declaration?.declarations ?? []).some((declarator) =>
     functionTypes.includes(declarator.init?.type ?? ''),
   )
-/** Where JSDoc is a contract: the statements of a contract file, or those exporting the web SDK's public names. */
+const sdkEntry = (filename: string) => sdkEntries.includes(repositoryPath(filename))
+/** Where JSDoc is a contract: the statements of a contract file, or the exports of an SDK entry's public names. */
 function contractStatements(filename: string, statements: Node[]) {
   if (contractFile(filename)) return statements
   if (!inSdk(filename)) return []
@@ -228,9 +295,7 @@ export default {
             const opening = context.sourceCode.getAllComments()[0]
             if (
               opening &&
-              (contractFile(context.filename) ||
-                path.relative(process.cwd(), context.filename) ===
-                  path.join('web/src/sdk/index.ts')) &&
+              (contractFile(context.filename) || sdkEntry(context.filename)) &&
               (statements.length === 0 || opening.end <= statements[0].start!)
             )
               contractDocs.add(opening.start)
@@ -244,9 +309,130 @@ export default {
               context.report({
                 node: comment,
                 message:
-                  'A comment is an excuse for unclear code: make the names and structure say it. An invariant (ordering, durability, replay) becomes a name, a type or a small function; a workaround keeps its why in the commit message and a regression test. Only contract JSDoc (on the exports of api.ts, refs.ts, ui.tsx and web/src/sdk), `Pi upstream:` markers and licence headers of copied code stay.',
+                  'A comment is an excuse for unclear code: make the names and structure say it. An invariant (ordering, durability, replay) becomes a name, a type or a small function; a workaround keeps its why in the commit message and a regression test. Only contract JSDoc (on the exports of api.ts, refs.ts, ui.solid.tsx and web/src/sdk), `Pi upstream:` markers and licence headers of copied code stay.',
               })
             }
+          },
+        }
+      },
+    },
+    'ui-framework-boundaries': {
+      meta: { schema: [] },
+      create(context: Context) {
+        const check = (node: ImportNode) => {
+          const source = staticString(node.source)
+          if (typeof source !== 'string') return
+          const local = localModule(context.filename, source)
+          const target = local === undefined ? undefined : repositoryPath(local)
+          if (
+            target === bridgeFile &&
+            !/^web\/src\/(app|sdk)\//.test(repositoryPath(context.filename))
+          )
+            return context.report({
+              node,
+              message: `Hosts render every contribution through one path, with its extension scope and error isolation. Only the core hosts in web/src import the bridge (${bridgeFile}); an extension renders another's contribution with Contribution, Provided or Slot from @/sdk/solid.`,
+            })
+          const typeOnly =
+            node.type === 'TSImportType' || node.importKind === 'type' || node.exportKind === 'type'
+          if (
+            !typeOnly &&
+            uiSdkComponents.test(source) &&
+            !uiKitFile(context.filename) &&
+            !inSdk(context.filename)
+          )
+            context.report({
+              node,
+              message: `ui-sdk is in beta and changes weekly, so its components are wrapped once in our UI kit, which also carries the theme. Import the component from @/components/ui; for a behavior the kit lacks, compose it with definePrimitive from @ui-sdk/core.`,
+            })
+        }
+        return {
+          ImportDeclaration: check,
+          ImportExpression: check,
+          ExportNamedDeclaration: check,
+          ExportAllDeclaration: check,
+          TSImportType: check,
+        }
+      },
+    },
+    'ui-kit-roles': {
+      meta: { schema: [] },
+      create(context: Context) {
+        if (uiKitFile(context.filename)) return {}
+        return {
+          JSXOpeningElement(node: Node & { name?: Node }) {
+            if (node.name?.type === 'JSXIdentifier' && node.name.name === 'form')
+              context.report({
+                node,
+                message:
+                  "A native form submit carries no source, so a change an agent submits is recorded as the person's. Use the kit's Form from @/components/ui and start the change in its type=\"submit\" Button's onClick, which Enter in a field presses too.",
+              })
+            if (
+              node.name?.type === 'JSXIdentifier' &&
+              node.name.name === 'button' &&
+              solidFile(context.filename) &&
+              !context.filename.endsWith('.test.solid.tsx')
+            )
+              context.report({
+                node,
+                message:
+                  "The agent bridge sees only kit parts, so an agent can neither find nor press a bare <button>, and its click is recorded without a source. Use the kit's Button from @/components/ui (size={null} variant={null} for an unstyled one) with a name unique on the page.",
+              })
+          },
+          JSXAttribute(node: Node & { name?: Node }) {
+            if (node.name?.name !== 'role') return
+            const role = staticString(node.value as Node | null | undefined)
+            if (typeof role !== 'string') return
+            const component = kitRoles.get(role)
+            if (component)
+              context.report({
+                node,
+                message: `A hand-made role="${role}" lacks the keyboard, focus and ARIA behavior people and agents rely on, and the agent bridge cannot see it. Use the kit's ${component} from @/components/ui.`,
+              })
+          },
+        }
+      },
+    },
+    'no-aria-pressed-button': {
+      meta: { schema: [] },
+      create(context: Context) {
+        const buttons = new Set<string | undefined>()
+        const triggers = new Set<string | undefined>()
+        return {
+          ImportDeclaration(node: Node) {
+            const source = staticString(node.source)
+            if (typeof source !== 'string') return
+            const target = localModule(context.filename, source)
+            const part = target && repositoryPath(target)
+            for (const specifier of node.specifiers ?? []) {
+              const imported = specifier.imported?.name
+              if (part === 'web/src/components/ui/button.solid.tsx' && imported === 'Button')
+                buttons.add(specifier.local?.name)
+              if (
+                (part === 'web/src/components/ui/tooltip.solid.tsx' &&
+                  imported === 'TooltipTrigger') ||
+                (part === 'web/src/components/ui/popover.solid.tsx' &&
+                  imported === 'PopoverTrigger')
+              )
+                triggers.add(specifier.local?.name)
+            }
+          },
+          JSXOpeningElement(node: Node & { name?: Node; attributes?: (Node & { name?: Node })[] }) {
+            const pressed = node.attributes?.find((attr) => attr.name?.name === 'aria-pressed')
+            const name = node.name?.name
+            if (!pressed || !name) return
+            if (!buttons.has(name)) {
+              if (!triggers.has(name)) return
+              const render = node.attributes?.find((attr) => attr.name?.name === 'render')
+              const value = (render?.value as Node | undefined)?.expression
+              const body = value?.body as (Node & { openingElement?: { name?: Node } }) | undefined
+              const rendered = value?.name ?? body?.openingElement?.name?.name
+              if (!rendered || !buttons.has(rendered)) return
+            }
+            context.report({
+              node: pressed,
+              message:
+                'The agent bridge sees only press on a Button, never its pressed state. Use Toggle from @/components/ui/toggle.solid.tsx, or SegmentedControl or Tabs for a one-of-many selection.',
+            })
           },
         }
       },
@@ -254,15 +440,133 @@ export default {
     'no-raw-stream': {
       meta: { schema: [] },
       create(context: Context) {
-        const message =
-          'One way to the server keeps every page live, reconnecting and replay-safe: read state with useDoc/useDocOf and call the server with useAction or api.action from @/sdk (docs/extensions/sdk.md), not fetch or a socket of your own.'
+        const why =
+          'One stream to Ultimate keeps every page live and reconnecting, and runs each read once for all of them'
+        const raw = `${why}: read state with useDoc/useDocOf and useAction, and call the server with api.action from @/sdk (docs/extensions/sdk.md), not fetch or a socket of your own to /api. Anything else, such as an external API or your surface's own backend, is yours to call.`
+        const polled = `${why}: a timer that calls api.action or refetch polls once per page. Give useAction an \`every\` (the server runs the read and pushes changes) or an \`on\` that changes with what it reads (docs/extensions/sdk.md).`
+        const toApi = (url: Node | undefined) => {
+          const text =
+            url?.type === 'Literal'
+              ? url.value
+              : url?.type === 'TemplateLiteral'
+                ? (url as { quasis?: { value?: { raw?: string } }[] }).quasis?.[0]?.value?.raw
+                : undefined
+          return typeof text === 'string' && text.startsWith('/api')
+        }
+        const firstArgument = (node: Node) => node.arguments?.[0]
+        const declarations = new WeakMap<Node, Map<string, Node>>()
+        const declared = (node: Node) => {
+          let program = node
+          while (program.parent) program = program.parent
+          let found = declarations.get(program)
+          if (found) return found
+          const named = new Map<string, Node>()
+          walk(program, (child) => {
+            if (child.type === 'FunctionDeclaration' && child.id?.name)
+              named.set(child.id.name, child)
+            if (child.type === 'VariableDeclarator' && child.id?.name && child.init)
+              named.set(child.id.name, child.init)
+            if (
+              child.type === 'VariableDeclarator' &&
+              child.id?.type === 'ObjectPattern' &&
+              child.init
+            )
+              for (const property of child.id.properties ?? [])
+                if (property.key?.name) named.set(property.key.name, child.init)
+          })
+          declarations.set(program, (found = named))
+          return found
+        }
+        const sdkImports = (node: Node) => {
+          let program = node
+          while (program.parent) program = program.parent
+          const localToImported = new Map<string, string>()
+          for (const statement of (program.body as Node[] | undefined) ?? [])
+            if (
+              statement.type === 'ImportDeclaration' &&
+              /^@\/sdk\/|\/web\/src\/sdk\//.test(String(statement.source?.value))
+            )
+              for (const specifier of statement.specifiers ?? [])
+                if (specifier.imported?.name && specifier.local?.name)
+                  localToImported.set(specifier.local.name, specifier.imported.name)
+          return localToImported
+        }
+        const answerIsUsed = (call: Node): boolean => {
+          const parent = call.parent
+          if (parent?.type === 'MemberExpression') {
+            const method = propertyName(parent)
+            if (method === 'then') return true
+            return method === 'catch' && !!parent.parent && answerIsUsed(parent.parent)
+          }
+          if (parent?.type === 'AwaitExpression') return answerIsUsed(parent)
+          return parent?.type === 'VariableDeclarator' || parent?.type === 'AssignmentExpression'
+        }
+        const readsUltimate = (node: Node, named: Map<string, Node>, sdk: Map<string, string>) => {
+          const resultOfUseAction = (identifier: Node) => {
+            const init = named.get(identifier.name ?? '')
+            return (
+              init?.type === 'CallExpression' &&
+              init.callee?.type === 'Identifier' &&
+              sdk.get(init.callee.name ?? '') === 'useAction'
+            )
+          }
+          const isSdkAction = (callee: Node | undefined) =>
+            callee?.type === 'MemberExpression' &&
+            callee.object?.type === 'Identifier' &&
+            sdk.get(callee.object.name ?? '') === 'api' &&
+            propertyName(callee) === 'action'
+          if (node.type !== 'CallExpression') return false
+          if ((node.arguments ?? []).some(isSdkAction)) return true
+          if (isSdkAction(node.callee)) return answerIsUsed(node)
+          const callee = node.callee
+          if (callee?.type === 'MemberExpression' && propertyName(callee) === 'refetch')
+            return callee.object?.type === 'Identifier' && resultOfUseAction(callee.object)
+          if (callee?.type === 'Identifier' && callee.name === 'refetch')
+            return resultOfUseAction(callee)
+          return false
+        }
+        const reachesARead = (start: Node, named: Map<string, Node>, sdk: Map<string, string>) => {
+          const seen = new Set<Node>()
+          const queue = [start]
+          const found: Node[] = []
+          for (let next = queue.shift(); next && !found.length; next = queue.shift()) {
+            if (seen.has(next)) continue
+            seen.add(next)
+            const declaration = next.type === 'Identifier' ? named.get(next.name ?? '') : undefined
+            if (declaration) {
+              queue.push(declaration)
+              continue
+            }
+            walk(next, (child) => {
+              if (readsUltimate(child, named, sdk)) found.push(child)
+              else if (child.type === 'CallExpression' && child.callee?.type === 'Identifier')
+                queue.push(child.callee)
+            })
+          }
+          return found.length > 0
+        }
+        const callbackAt: Record<string, number> = {
+          every: 1,
+          retryAfter: 1,
+          setInterval: 0,
+          setTimeout: 0,
+        }
         return {
           CallExpression(node: Node) {
-            if (isGlobal(node.callee, 'fetch')) context.report({ node, message })
+            if (isGlobal(node.callee, 'fetch') && toApi(firstArgument(node)))
+              context.report({ node, message: raw })
+            const timer = node.callee?.type === 'Identifier' ? node.callee.name : undefined
+            const at = timer === undefined ? undefined : callbackAt[timer]
+            const callback = at === undefined ? undefined : node.arguments?.[at]
+            if (callback && reachesARead(callback, declared(node), sdkImports(node)))
+              context.report({ node, message: polled })
           },
           NewExpression(node: Node) {
-            if (isGlobal(node.callee, 'EventSource') || isGlobal(node.callee, 'WebSocket'))
-              context.report({ node, message })
+            if (
+              (isGlobal(node.callee, 'EventSource') || isGlobal(node.callee, 'WebSocket')) &&
+              toApi(firstArgument(node))
+            )
+              context.report({ node, message: raw })
           },
         }
       },
@@ -361,6 +665,22 @@ export default {
         }
       },
     },
+    'no-server-helpers-in-web-tests': {
+      meta: { schema: [] },
+      create(context: Context) {
+        const check = (node: ImportNode) => {
+          const source = node.source?.value
+          if (typeof source !== 'string' || !source.startsWith('.')) return
+          if (resolved(context.filename, source).join('/') === 'test/helpers.ts')
+            context.report({
+              node,
+              message:
+                "test/helpers.ts imports the server, and a web test is type-checked by tsconfig.web.json, which then fails as 'Invalid tsconfig'. Use the browser-safe helpers in test/web (solid-dom-setup.ts, fake-source.ts, agent-names.ts) and vi.advanceTimersByTimeAsync or settle() instead of until.",
+            })
+        }
+        return { ImportDeclaration: check, ImportExpression: check }
+      },
+    },
     'no-test-timeout': {
       meta: { schema: [] },
       create(context: Context) {
@@ -409,6 +729,28 @@ export default {
                 message:
                   'After a crash, replay runs a call again, so a call with effects would repeat them: spread ...readOnly for a tool that only reads, or ...safeToRerun(why a rerun does no harm), from lib/replay.ts.',
               })
+          },
+        }
+      },
+    },
+    'no-unowned-work': {
+      meta: { schema: [] },
+      create(context: Context) {
+        const message =
+          'Work started and not awaited is lost on a crash and never retried: create it as a task in the commit that decides it (defineEffect from lib/effect.ts), or await it. Name the two exceptions from lib/errors.ts: rebuiltOnOpen(why, work) when open derives it again (a projection, a cache, a sweep), inProcess(why, work) when it belongs to this process only (a request, a stream, a child process, shutdown).'
+        const unowned = (node: Node | undefined): boolean => {
+          if (node?.type === 'UnaryExpression' && node.operator === 'void')
+            return node.argument?.type === 'CallExpression'
+          if (node?.type !== 'CallExpression') return false
+          if (node.callee?.type === 'Identifier' && node.callee.name === 'inBackground') return true
+          return (
+            node.callee?.type === 'MemberExpression' &&
+            ['catch', 'then', 'finally'].includes(String(propertyName(node.callee)))
+          )
+        }
+        return {
+          ExpressionStatement(node: Node) {
+            if (unowned(node.expression)) context.report({ node, message })
           },
         }
       },
@@ -464,18 +806,19 @@ export default {
       create(context: Context) {
         const own = extensionOf(context.filename)
         if (!own) return {}
-        // Server code reaches another extension through its api.ts, browser code through its ui.tsx.
         const browser = context.filename.endsWith('.tsx')
-        const allowed = browser ? 'ui.tsx' : 'api.ts'
+        const allowed = browser ? ['refs.ts', 'ui.solid.tsx'] : ['api.ts']
         const how = browser
-          ? 'its ui.tsx (components, hooks and the refs of its documents and actions)'
+          ? 'its refs.ts (the refs of its documents and actions) or its ui.solid.tsx (its components, hooks and points)'
           : 'its api.ts (a service, document or event token)'
         const check = (node: ImportNode) => {
           const source = node.source?.value
           if (typeof source !== 'string' || !source.startsWith('.')) return
           if (node.importKind === 'type' || node.exportKind === 'type') return
-          const [directory, extension, ...file] = resolved(context.filename, source)
-          if (directory === 'extensions' && extension !== own && file.join('/') !== allowed)
+          const target = resolved(context.filename, source)
+          const [directory, extension, ...file] =
+            target[0] === '.ultimate' ? target.slice(1) : target
+          if (directory === 'extensions' && extension !== own && !allowed.includes(file.join('/')))
             context.report({
               node,
               message: `Extensions meet only at their contracts, so each can change and reload on its own. ${own} imports ${extension}/${file.join('/')} at runtime; reach ${extension} through ${how}, import types with \`import type\`, or move a pure helper to lib/.`,
@@ -570,7 +913,7 @@ export default {
                 node,
                 `Start ${file} with a doc comment on what it offers; its first sentence is the one-line summary.`,
               )
-            if (file === 'ui.tsx') return
+            if (file === 'ui.solid.tsx') return
             const allowed = definers[file]
             const services = new Set<string>()
             const body = (node.body as Node[] | undefined) ?? []
@@ -644,7 +987,7 @@ export default {
       meta: { schema: [] },
       create(context: Context) {
         const contract = contractFile(context.filename)
-        if (!contract || contract.file === 'ui.tsx') return {}
+        if (!contract || contract.file === 'ui.solid.tsx') return {}
         const own = contract.extension
         return {
           CallExpression(node: Node) {

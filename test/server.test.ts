@@ -18,7 +18,7 @@ import {
 import { context } from '../server/harness.ts'
 import { UiState } from '../shared/ui-state.ts'
 import { Metadata } from '../server/metadata.ts'
-import type { ConversationSummary, ServerEvents } from '../shared/protocol.ts'
+import type { ServerEvents } from '../shared/protocol.ts'
 import { Logins } from '../extensions/models/server.ts'
 import { fixture, orderedSource, servers } from './server-fixture.ts'
 import { eventHost } from './helpers.ts'
@@ -298,6 +298,52 @@ export const actions={ late: async()=>{host.onOpen(async()=>{opened=true}); retu
     await stream.close()
   })
 
+  it('commits release work, then closes the harness before extensions, so a task running at shutdown resumes instead of faulting', async () => {
+    const { server, options } = await fixture(false, {
+      teardown: `import { defineDoc, defineExtension, defineTask, ROOT_CONVERSATION_ID } from '@earendil-works/pi-durable'
+import { awaitWithContext, BACKGROUND_CONTEXT } from '@earendil-works/chord/context'
+import { existsSync, writeFileSync } from 'node:fs'
+import { defineApi } from '../../shared/extension-api.ts'
+const Probe = defineApi()('probe')
+let host, started = false
+const gate = Promise.withResolvers()
+const Task = defineTask({ name: 'teardown.task', version: 1, initial: () => ({ phase: 'run' }), phases: {
+  run: async (_task, runtime, ctx) => {
+    started = true
+    if (!existsSync(host.userHome + '/closed')) await awaitWithContext(gate.promise, ctx)
+    host.need(Probe).ping()
+    await runtime.commit(() => ({ status: 'terminal', outcome: { status: 'completed', result: null } }), ctx)
+  } },
+  abort: (_task, runtime, ctx) => runtime.commit(() => ({ status: 'terminal', outcome: { status: 'aborted' } }), ctx) })
+const Released = defineDoc({ kind: 'teardown.released', checkpointWhen: () => false, version: 1, scope: 'conversation', history: 'latest', fork: 'initial', initial: () => ({ at: 0 }) })
+export const docs = [Released]
+export default h => { host = h; h.implement(Probe, { ping: () => true }); h.onOpen(async (opened) => { opened.defer(() => h.harness().commit(async tx => { (await tx.doc(Released, ROOT_CONVERSATION_ID)).at = 1 }, BACKGROUND_CONTEXT)) }); h.onClose(async () => { writeFileSync(h.userHome + '/closed', ''); gate.resolve(); await new Promise(r => setImmediate(r)) }); return defineExtension({ name: 'teardown', tasks: [Task] }) }
+export const actions = {
+  start: async () => { await host.harness().commit(tx => tx.createTask(Task, null, { conversationId: ROOT_CONVERSATION_ID, ownership: { kind: 'conversation' }, background: true }), BACKGROUND_CONTEXT); return true },
+  started: async () => started,
+  released: async () => (await host.harness().snapshot(Released, ROOT_CONVERSATION_ID, BACKGROUND_CONTEXT))?.at }`,
+    })
+    await post(server, '/api/extensions/teardown/actions/start', { args: null })
+    await until(
+      async () =>
+        (await post(server, '/api/extensions/teardown/actions/started', { args: null })).data
+          .result === true,
+    )
+    servers.splice(servers.indexOf(server), 1)
+    await server.close()
+    const reopened = await createServer(options)
+    servers.push(reopened)
+    const task = async () =>
+      (await reopened.harness.commit((tx) => tx.scanTasks({ kind: 'teardown.task' }, 10), context))
+        .items[0]
+    await until(async () => (await task()).state.status === 'terminal')
+    expect((await task()).state).toMatchObject({ outcome: { status: 'completed' } })
+    expect(
+      (await post(reopened, '/api/extensions/teardown/actions/released', { args: null })).data
+        .result,
+    ).toBe(1)
+  })
+
   it('settles failing process resource cleanups and still closes the server', async () => {
     const { server } = await fixture(false, {
       resourcecleanup: `import { defineExtension } from '@earendil-works/pi-durable'
@@ -363,7 +409,9 @@ export default host => { host.resource('cleanup.process',()=>{
       const { server } = await fixture()
       expect(server.url).toBe(`http://127.0.0.1:${server.port}`)
       expect((await fetch(server.url)).status).toBe(200)
-      expect((await post(server, '/api/ui', { set: { 'test.isolated': true } })).status).toBe(200)
+      expect(
+        (await post(server, '/api/ui', { ops: [{ key: 'test.isolated', value: true }] })).status,
+      ).toBe(200)
       expect(await server.host.uiState(context)).toEqual({ 'test.isolated': true, 'ui.rev': 1 })
       await (
         await server.root.submit({ type: 'input', content: 'self URL' }, context)
@@ -517,11 +565,16 @@ export default host => { host.resource('cleanup.process',()=>{
     const first = await attach(server)
     const second = await attach(server, { conversation: created.data.id as number })
     expect(
-      await post(server, '/api/ui', { set: { 'shell.panel': 'tasks', 'app.count': 2 } }),
+      await post(server, '/api/ui', {
+        ops: [
+          { key: 'shell.panel', value: 'tasks' },
+          { key: 'app.count', value: 2 },
+        ],
+      }),
     ).toEqual({ status: 200, data: { ok: true, rev: 1 } })
     // The revision is the server's: a client cannot set or delete it.
-    expect((await post(server, '/api/ui', { set: { 'ui.rev': 9 } })).status).toBe(400)
-    expect((await post(server, '/api/ui', { delete: ['ui.rev'] })).status).toBe(400)
+    expect((await post(server, '/api/ui', { ops: [{ key: 'ui.rev', value: 9 }] })).status).toBe(400)
+    expect((await post(server, '/api/ui', { ops: [{ key: 'ui.rev' }] })).status).toBe(400)
     await until(() => second.events.some((event) => event.name === 'uiOps'))
     let value = (second.events.find((event) => event.name === 'ui')!.data as ServerEvents['ui'])
       .value
@@ -529,7 +582,7 @@ export default host => { host.resource('cleanup.process',()=>{
       value = applyImmutable(value, (event.data as ServerEvents['uiOps']).ops)
     expect(value).toEqual({ 'shell.panel': 'tasks', 'app.count': 2, 'ui.rev': 1 })
     const count = second.events.filter((event) => event.name === 'uiOps').length
-    await post(server, '/api/ui', { delete: ['app.count'] })
+    await post(server, '/api/ui', { ops: [{ key: 'app.count' }] })
     await until(() => second.events.filter((event) => event.name === 'uiOps').length > count)
     const deletion = second.events.filter((event) => event.name === 'uiOps').at(-1)!
     expect(applyImmutable(value, (deletion.data as ServerEvents['uiOps']).ops)).toEqual({
@@ -542,14 +595,14 @@ export default host => { host.resource('cleanup.process',()=>{
       async (tx) => tx.appendEntry(server.root.id, { kind: 'test.marker' }),
       context,
     )
-    await post(server, '/api/ui', { set: { 'shell.panel': 'settings' } })
+    await post(server, '/api/ui', { ops: [{ key: 'shell.panel', value: 'settings' }] })
     const fork = await server.root.fork(entry.id, { ownership: { kind: 'ownerless' } }, context)
     expect(await server.harness.snapshot(UiState, fork.id, context)).toEqual({
       'shell.panel': 'tasks',
       'ui.rev': 2,
     })
     expect(await server.host.uiState(context)).toEqual({ 'shell.panel': 'settings', 'ui.rev': 3 })
-    await post(server, '/api/ui', { set: { 'shell.panel': 'tasks' } })
+    await post(server, '/api/ui', { ops: [{ key: 'shell.panel', value: 'tasks' }] })
     await first.close()
     await second.close()
     await server.vite.watcher.close()
@@ -567,15 +620,16 @@ export default host => { host.resource('cleanup.process',()=>{
   it('validates UI keys and the merged document size atomically', async () => {
     const { server } = await fixture()
     for (const key of ['', 'bad key', 'x'.repeat(201)])
-      expect((await post(server, '/api/ui', { set: { [key]: true } })).status).toBe(400)
-    expect((await post(server, '/api/ui', { delete: [4] })).status).toBe(400)
-    expect((await post(server, '/api/ui', { set: [] })).status).toBe(400)
-    await post(server, '/api/ui', { set: { large: 'x'.repeat(200000) } })
-    expect((await post(server, '/api/ui', { set: { extra: 'é'.repeat(40000) } })).status).toBe(413)
+      expect((await post(server, '/api/ui', { ops: [{ key, value: true }] })).status).toBe(400)
+    expect((await post(server, '/api/ui', { ops: [{ key: 4 }] })).status).toBe(400)
+    expect((await post(server, '/api/ui', { ops: {} })).status).toBe(400)
+    await post(server, '/api/ui', { ops: [{ key: 'large', value: 'x'.repeat(200000) }] })
+    expect(
+      (await post(server, '/api/ui', { ops: [{ key: 'extra', value: 'é'.repeat(40000) }] })).status,
+    ).toBe(413)
     expect(await server.host.uiState(context)).toEqual({ large: 'x'.repeat(200000), 'ui.rev': 1 })
     await post(server, '/api/ui', {
-      set: JSON.parse('{"__proto__":{"safe":true}}'),
-      delete: ['large'],
+      ops: [JSON.parse('{"key":"__proto__","value":{"safe":true}}'), { key: 'large' }],
     })
     expect(await server.host.uiState(context)).toEqual(
       JSON.parse('{"__proto__":{"safe":true},"ui.rev":2}'),
@@ -794,6 +848,219 @@ export default host => { host.resource('cleanup.process',()=>{
     )
     await stream.close()
   })
+  it('sends conversations and tasks once whole, then as ops that rebuild what a fresh stream gets', async () => {
+    const { server } = await fixture()
+    const stream = await attach(server)
+    const created = (await post(server, '/api/conversations', { title: 'Another' })).data
+      .id as ConversationId
+    server.host.faux!.setResponses([held])
+    await post(server, `/api/conversations/${created}/submit`, { text: 'work' })
+    const busy = () => stream.conversations().find((item) => item.id === created)?.busy
+    const running = () =>
+      Object.values(stream.tasks().tasks).some((task) => task.conversationId === created)
+    const sameAsFresh = async () => {
+      const fresh = await attach(server)
+      try {
+        await until(
+          () =>
+            JSON.stringify(stream.conversations()) === JSON.stringify(fresh.conversations()) &&
+            JSON.stringify(stream.tasks()) === JSON.stringify(fresh.tasks()),
+        )
+      } finally {
+        await fresh.close()
+      }
+    }
+    // While the turn runs: the task and the busy flag arrived as ops on the first stream.
+    await until(() => busy() === true && running())
+    await sameAsFresh()
+    await post(server, `/api/conversations/${created}/abort`)
+    await server.harness.waitForIdle(context)
+    await until(() => busy() === false && !running())
+    await sameAsFresh()
+    const sent = (name: string) => stream.events.filter((event) => event.name === name).length
+    expect([sent('conversations'), sent('tasks')]).toEqual([1, 1])
+    expect(sent('conversationsOps')).toBeGreaterThan(0)
+    expect(sent('tasksOps')).toBeGreaterThan(0)
+    expect(stream.conversations()).toEqual(server.api.conversations())
+    await stream.close()
+  })
+  it('refuses only the subscription whose document fails to open, and opens its siblings', async () => {
+    const { server } = await fixture(true)
+    const stream = await attach(server, { view: false })
+    const { id } = stream.events.find((event) => event.name === 'stream')!.data as { id: string }
+    const doc = server.extensions.doc.bind(server.extensions)
+    vi.spyOn(server.extensions, 'doc').mockImplementation((kind) => {
+      if (kind === 'test.counter') throw new Error('broken')
+      return doc(kind)
+    })
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const response = await fetch(`${server.url}/api/events/${id}`, {
+      method: 'POST',
+      headers: { Origin: server.url },
+      body: JSON.stringify({
+        subscribe: [
+          { sub: 5, docs: ['test.counter'], view: false },
+          { sub: 6, docs: [], view: true },
+        ],
+        unsubscribe: [],
+      }),
+    })
+    expect({ status: response.status, data: await response.json() }).toEqual({
+      status: 200,
+      data: { ok: true, refused: { 5: 500 } },
+    })
+    await until(() => stream.events.some((event) => event.name === 'view' && event.sub === 6))
+
+    // An invalid conversation or document list refuses only its own open.
+    const mixed = await fetch(`${server.url}/api/events/${id}`, {
+      method: 'POST',
+      headers: { Origin: server.url },
+      body: JSON.stringify({
+        subscribe: [
+          { sub: 10, conversation: 0, docs: [], view: true },
+          { sub: 11, docs: [42], view: false },
+          { sub: 12, docs: [], view: true },
+        ],
+        unsubscribe: [],
+      }),
+    })
+    expect(await mixed.json()).toEqual({ ok: true, refused: { 10: 400, 11: 400 } })
+    await until(() => stream.events.some((event) => event.name === 'view' && event.sub === 12))
+
+    // A watch that fails to start is refused and stopped, so the same id can open later.
+    const harness = server.harness
+    const watchDoc = harness.watchDoc.bind(harness)
+    const stopped = vi.fn<() => void>()
+    const spy = vi.spyOn(harness, 'watchDoc').mockImplementationOnce(async (...args) => {
+      const watch = (await watchDoc(...args))!
+      const stop = watch.stop.bind(watch)
+      return Object.assign(watch, {
+        start: () => {
+          throw new Error('cannot start')
+        },
+        stop: () => {
+          stopped()
+          return stop()
+        },
+      })
+    })
+    const open = () =>
+      fetch(`${server.url}/api/events/${id}`, {
+        method: 'POST',
+        headers: { Origin: server.url },
+        body: JSON.stringify({
+          subscribe: [{ sub: 7, docs: ['pi.live'], view: false }],
+          unsubscribe: [],
+        }),
+      }).then((answer) => answer.json())
+    expect(await open()).toEqual({ ok: true, refused: { 7: 500 } })
+    expect(stopped).toHaveBeenCalledOnce()
+    spy.mockRestore()
+    expect(await open()).toEqual({ ok: true, refused: {} })
+    await until(() => stream.events.some((event) => event.name === 'doc' && event.sub === 7))
+    await stream.close()
+  })
+  it('runs a subscribed read once for every page, pushes only changed answers, and stops with its last page', async () => {
+    const { server } = await fixture(false, {
+      probe: `import { defineExtension } from '@earendil-works/pi-durable'
+
+let runs = 0
+let ticks = 0
+let value = 'one'
+export default defineExtension({ name: 'probe' })
+export const actions = {
+  value: async (args) => {
+    if (args?.fail) throw new Error('probe failed')
+    runs++
+    return value
+  },
+  tick: async () => ++ticks,
+  set: async (args) => { value = args.value; return value },
+  runs: async () => runs,
+}`,
+    })
+    const first = await attach(server, { view: false })
+    const second = await attach(server, { view: false })
+    const streamId = (stream: typeof first) =>
+      (stream.events.find((event) => event.name === 'stream')!.data as { id: string }).id
+    await until(() => first.events.some((e) => e.name === 'stream'))
+    await until(() => second.events.some((e) => e.name === 'stream'))
+    const subscribe = (
+      stream: typeof first,
+      body: object,
+      headers: object = { Origin: server.url },
+    ) =>
+      fetch(`${server.url}/api/events/${streamId(stream)}`, {
+        method: 'POST',
+        headers: headers as Record<string, string>,
+        body: JSON.stringify({ subscribe: [], unsubscribe: [], ...body }),
+      }).then((answer) => answer.json())
+    const read = { extension: 'probe', action: 'value', args: null }
+    const answers = (stream: typeof first, sub: number) =>
+      stream.events.filter((event) => event.name === 'read' && event.sub === sub).map((e) => e.data)
+    const runs = async () =>
+      (await post(server, '/api/extensions/probe/actions/runs', { args: null })).data
+        .result as number
+
+    expect(await subscribe(first, { subscribe: [{ sub: 1, read, every: 250 }] })).toEqual({
+      ok: true,
+      refused: {},
+    })
+    await until(() => answers(first, 1).length === 1)
+    expect(await subscribe(second, { subscribe: [{ sub: 1, read, every: 250 }] })).toEqual({
+      ok: true,
+      refused: {},
+    })
+    await until(() => answers(second, 1).length === 1)
+    expect(server.api.reads()).toBe(1)
+    expect([answers(first, 1), answers(second, 1)]).toEqual([
+      [{ result: 'one' }],
+      [{ result: 'one' }],
+    ])
+
+    await post(server, '/api/extensions/probe/actions/set', { args: { value: 'two' } })
+    await until(() => answers(first, 1).length === 2 && answers(second, 1).length === 2)
+    expect(answers(first, 1).at(-1)).toEqual({ result: 'two' })
+
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    expect(
+      await subscribe(first, {
+        subscribe: [
+          { sub: 2, read: { ...read, args: { fail: true } } },
+          { sub: 3, read: { extension: 'probe', action: 'missing', args: null } },
+        ],
+      }),
+    ).toEqual({ ok: true, refused: {} })
+    await until(() => answers(first, 2).length === 1 && answers(first, 3).length === 1)
+    expect(answers(first, 2)).toEqual([{ error: 'probe failed', status: 500 }])
+    expect(answers(first, 3)).toEqual([{ error: 'Unknown extension action', status: 404 }])
+
+    expect(await subscribe(second, { subscribe: [{ sub: 5, read }] }, {})).toEqual({
+      ok: true,
+      refused: {},
+    })
+    await until(() => answers(second, 5).length === 1)
+    expect(answers(second, 5)).toEqual([
+      { error: 'Extension actions require a browser request', status: 403 },
+    ])
+
+    expect(server.api.reads()).toBe(3)
+    await subscribe(first, { unsubscribe: [2, 3] })
+    expect(server.api.reads()).toBe(1)
+    await subscribe(second, { unsubscribe: [1, 5] })
+    await second.close()
+    expect(server.api.reads()).toBe(1)
+    await first.close()
+    await until(() => server.api.reads() === 0)
+    const stopped = await runs()
+    const third = await attach(server, { view: false })
+    await until(() => third.events.some((e) => e.name === 'stream'))
+    const tick = { extension: 'probe', action: 'tick', args: null }
+    await subscribe(third, { subscribe: [{ sub: 6, read: tick, every: 250 }] })
+    await until(() => answers(third, 6).length >= 3)
+    expect(await runs()).toBe(stopped)
+    await third.close()
+  })
   it('serves published titles and activity to clients and server facets without deriving entries', async () => {
     const { server } = await fixture(false, {
       summaries: `import { defineExtension } from '@earendil-works/pi-durable'
@@ -823,13 +1090,7 @@ export const actions = { list: async (_args, ctx) => ctx.host.conversations() }`
       answerAt: 2000,
     })
     await until(() =>
-      stream.events.some(
-        (event) =>
-          event.name === 'conversations' &&
-          (event.data as ConversationSummary[]).some(
-            (item) => item.id === created && item.answerAt === 2000,
-          ),
-      ),
+      stream.conversations().some((item) => item.id === created && item.answerAt === 2000),
     )
     expect(
       (await post(server, '/api/extensions/summaries/actions/list', { args: null })).data.result,
@@ -885,28 +1146,42 @@ export const actions = { list: async (_args, ctx) => ctx.host.conversations() }`
     expect(stream.events.some((event) => event.name === 'view')).toBe(false)
     await stream.close()
   })
-  it('carries subscriptions opened and closed on one stream, each event tagged with its id', async () => {
+  it('carries subscriptions opened and closed on one stream in batches, each event tagged with its id', async () => {
     const { server } = await fixture(true)
     const stream = await attach(server, { docs: ['test.counter'] })
     const { id } = stream.events.find((event) => event.name === 'stream')!.data as { id: string }
-    const call = (method: string, sub: number, data?: unknown) =>
-      fetch(`${server.url}/api/events/${id}/${sub}`, {
-        method,
+    const batch = (
+      subscribe: { sub: number; conversation?: number; docs?: string[]; view?: boolean }[],
+      unsubscribe: number[] = [],
+      streamId = id,
+    ) =>
+      fetch(`${server.url}/api/events/${streamId}`, {
+        method: 'POST',
         headers: { Origin: server.url },
-        ...(data !== undefined && { body: JSON.stringify(data) }),
-      }).then((response) => response.status)
+        body: JSON.stringify({ subscribe, unsubscribe }),
+      }).then(async (response) => ({ status: response.status, data: await response.json() }))
     const docs = { docs: ['test.counter'], view: false }
-    expect(await call('POST', 5, docs)).toBe(200)
-    expect(await call('POST', 6, docs)).toBe(200)
-    expect(await call('DELETE', 6)).toBe(200)
-    // A close that overtakes its open wins.
-    expect(await call('DELETE', 7)).toBe(200)
-    expect(await call('POST', 7, docs)).toBe(200)
-    expect(await call('POST', 8, { conversation: 999 })).toBe(404)
+    // One request opens several; a refused one fails alone.
     expect(
-      (await fetch(`${server.url}/api/events/${crypto.randomUUID()}/1`, { method: 'DELETE' }))
-        .status,
-    ).toBe(410)
+      await batch([
+        { sub: 5, ...docs },
+        { sub: 6, ...docs },
+        { sub: 8, conversation: 999 },
+      ]),
+    ).toEqual({ status: 200, data: { ok: true, refused: { 8: 404 } } })
+    expect((await batch([], [6])).status).toBe(200)
+    // A close that overtakes its open wins, once: the open consumes it, and a resent close of a closed one is harmless.
+    expect((await batch([], [7])).status).toBe(200)
+    expect((await batch([{ sub: 7, ...docs }])).status).toBe(200)
+    expect((await batch([], [6])).status).toBe(200)
+    expect((await batch([{ sub: 9, ...docs }], [9])).status).toBe(200)
+    const invalid = await fetch(`${server.url}/api/events/${id}`, {
+      method: 'POST',
+      headers: { Origin: server.url },
+      body: JSON.stringify({ subscribe: [null], unsubscribe: [] }),
+    })
+    expect(invalid.status).toBe(400)
+    expect((await batch([], [1], crypto.randomUUID())).status).toBe(410)
     const of = (name: string) =>
       stream.events.filter((event) => event.name === name).map((event) => event.sub)
     await until(() => of('doc').length === 3)
@@ -922,7 +1197,24 @@ export const actions = { list: async (_args, ctx) => ctx.host.conversations() }`
     expect(of('docOps')).toEqual([0, 5])
     // Closing the stream ends it with all its subscriptions.
     await stream.close()
-    await until(async () => (await call('DELETE', 5)) === 410)
+    await until(async () => (await batch([], [5])).status === 410)
+  })
+  it('ends a stream whose closes of never-opened subscriptions pile up, so it starts over clean', async () => {
+    const { server } = await fixture(true)
+    const stream = await attach(server, { view: false })
+    const { id } = stream.events.find((event) => event.name === 'stream')!.data as { id: string }
+    const close = (subs: number[]) =>
+      fetch(`${server.url}/api/events/${id}`, {
+        method: 'POST',
+        headers: { Origin: server.url },
+        body: JSON.stringify({ subscribe: [], unsubscribe: subs }),
+      }).then((response) => response.status)
+    const range = (from: number) => Array.from({ length: 500 }, (_, index) => from + index)
+    expect(await close(range(100))).toBe(200)
+    expect(await close(range(600))).toBe(200)
+    expect(await close(range(1100))).toBe(410)
+    await until(() => stream.connections() > 1)
+    await stream.close()
   })
   it('runs logins in the models extension: prompt, answer, cancel, no credential leak, dead flows cancelled', async () => {
     const { server, options } = await fixture(false, {
@@ -945,13 +1237,13 @@ export const actions = { list: async (_args, ctx) => ctx.host.conversations() }`
     const stream = await attach(server, { docs: ['models.login'] })
     const action = (name: string, args: unknown, conversationId = 1) =>
       post(server, `/api/extensions/models/actions/${name}`, { args, conversationId })
-    const flows = async (id = 1) =>
-      (await server.harness.snapshot(Logins, id as ConversationId, context))?.flows ?? {}
+    const flows = async () =>
+      (await server.harness.snapshot(Logins, 1 as ConversationId, context))?.flows ?? {}
     const login = async (conversationId = 1) => {
       const response = await action('login', { provider: 'stub', type: 'api_key' }, conversationId)
       expect(response.status).toBe(200)
       const flowId = String(response.data.result.flowId)
-      await until(async () => (await flows(conversationId))[flowId]?.prompt?.type === 'secret')
+      await until(async () => (await flows())[flowId]?.prompt?.type === 'secret')
       return flowId
     }
     const first = await login()
@@ -970,12 +1262,12 @@ export const actions = { list: async (_args, ctx) => ctx.host.conversations() }`
     expect((await action('answer', { flowId: blank, value: '' })).status).toBe(200)
     await until(async () => (await flows())[blank].status === 'complete')
     expect(answered).toBe('')
-    // A flow lives in the document of the conversation that started it.
+    // Logins are machine-wide: a flow started from any conversation lives on the root.
     const other = Number((await post(server, '/api/conversations', {})).data.id)
     const second = await login(other)
     expect((await action('cancel', { flowId: second })).status).toBe(200)
-    await until(async () => (await flows(other))[second].status === 'cancel')
-    expect((await flows(other))[second].prompt).toBeUndefined()
+    await until(async () => (await flows())[second].status === 'cancel')
+    expect((await flows())[second].prompt).toBeUndefined()
     expect((await action('answer', { flowId: second, value: 'late-credential' })).data).toEqual({
       error: 'Unknown login flow',
     })

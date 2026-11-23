@@ -7,7 +7,8 @@ import { parseArgs } from 'node:util'
 import { projectHome } from '../lib/project-paths.ts'
 import { acquireLock, readOwner, retireStorageOwner } from '../lib/lock.ts'
 import { deadline, pace } from '../lib/timers.ts'
-import { watch, existsSync, readFileSync } from 'node:fs'
+import { watch, existsSync, readdirSync, readFileSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { watchRoots } from '../server/watch-roots.ts'
 import { join, resolve as resolvePath } from 'node:path'
 import { createServer, connect } from 'node:net'
@@ -29,14 +30,30 @@ if (positionals.length > 1) throw new Error('Usage: ultimate [dir] [--port N] [-
 const opening = !values['no-open'] && process.env.ULTIMATE_NO_OPEN !== '1'
 const available = (name: string) =>
   process.env.PATH?.split(':').some((path) => existsSync(join(path, name)))
+function installedChromeApp(app: string) {
+  const apps = join(homedir(), 'Applications/Chrome Apps.localized')
+  const value = (text: string, key: string) =>
+    text.match(new RegExp(`<key>${key}</key>\\s*<string>([^<]*)</string>`))?.[1]
+  try {
+    const plist = readdirSync(apps)
+      .filter((bundle) => bundle.endsWith('.app'))
+      .map((bundle) => readFileSync(join(apps, bundle, 'Contents/Info.plist'), 'utf8'))
+      .find((text) => value(text, 'CrAppModeShortcutURL')?.startsWith(`${app}/`))
+    return plist && value(plist, 'CrAppModeShortcutID')
+  } catch {
+    return undefined
+  }
+}
 function openWindow(port: number) {
   const app = `http://ultimate.localhost:${port}`
   const tab = `http://127.0.0.1:${port}`
   let command = process.platform === 'darwin' ? 'open' : 'xdg-open'
   let args = [tab]
   if (process.platform === 'darwin') {
-    if (existsSync('/Applications/Google Chrome.app'))
-      args = ['-na', 'Google Chrome', '--args', `--app=${app}`]
+    if (existsSync('/Applications/Google Chrome.app')) {
+      const id = installedChromeApp(app)
+      args = ['-na', 'Google Chrome', '--args', id ? `--app-id=${id}` : `--app=${app}`]
+    }
   } else if (available('omarchy-launch-webapp')) {
     command = 'omarchy-launch-webapp'
     args = [app]
@@ -121,6 +138,7 @@ let swapping = false
 let stopping = false
 let crashPage = false
 let failures = 0
+const stableAfterMs = 60000
 let generation = 0
 let announced = false
 let stderr = ''
@@ -233,6 +251,7 @@ type Core = {
   child: ChildProcess
   port: number
   generation: number
+  readyAt?: number
   stderr: string
   messages: ChildMessage[]
   reports: Map<'web' | 'access', CoreReport>
@@ -344,6 +363,7 @@ function boot(previousBuild?: BuildInfo): Core {
     children.delete(core)
     if (core === active && !swapping && !stopping) {
       active = undefined
+      failures = Date.now() - core.readyAt! < stableAfterMs ? failures + 1 : 0
       display.lifecycle('crashed')
       display.log('error', 'supervisor', `Core ${core.generation} exited unexpectedly`)
       void recover().catch((error: unknown) =>
@@ -387,9 +407,9 @@ async function start(core: Core) {
     return
   }
   active = core
+  core.readyAt = Date.now()
   display.lifecycle('ready', { generation: core.generation, pid: core.child.pid })
   for (const report of core.reports.values()) display.report(report)
-  failures = 0
   crashPage = false
   flush()
   if (!announced) {

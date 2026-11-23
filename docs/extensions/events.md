@@ -7,7 +7,7 @@ ephemeral bus and the readiness events.
 
 For "this happened" that other extensions act on or people read later, use a durable event. Define its token once
 with `defineEvent<Data>('<extension>.<event>', { version? })` from `shared/events.ts` in the emitter's `refs.ts`, so
-the browser can use it too, and re-export it from `api.ts` (for server code) and `ui.tsx` (for other extensions'
+the browser can use it too, and re-export it from `api.ts` (for server code) and `ui.solid.tsx` (for other extensions'
 browser code). The names an extension's `api.ts` and `refs.ts` define are listed in its `ExtensionInfo.events`, so a
 wait on any other name fails at once. `{ fails: '<event>' }` marks an event that rules another one out
 (`workspaces.landing-failed` fails `workspaces.landed`): a wait on that one ends with it. Then:
@@ -23,14 +23,15 @@ wait on any other name fails at once. `{ fails: '<event>' }` marks an event that
   after the newest event instead of replaying the log.
 - `host.eventLog.recent({ events?, since?, before?, order?, limit })` reads the newest first (oldest first with
   `order: 'ascending'`) as plain copies, `since` and `before` exclusive event ids; `host.eventLog.reactors()`
-  shows each reactor's cursor, lag and last failure. In the browser, `useEvents({ events?, limit })` from `@/sdk` streams
+  shows each reactor's cursor, lag and last failure. In the browser, `useEvents({ events?, limit })` from `@/sdk/solid` streams
   the root's feed of the latest 100 events.
 
 Each distinct `host.notice` message of a facet is also recorded as an `ultimate.notice` event while storage is open.
 Keep events few and small: they are history.
 
 The events today: `lineage.branched` and `lineage.rooted` (lineage has conversations mark the intent title as
-generated), `workspaces.landed` (lineage notes the submitter's tree root) and `models.login-changed` (health resets
+generated), `workspaces.landed` (lineage notes the submitter's tree root), `conversations.concluded` (coding-tools stops the
+concluded tree's background processes) and `models.login-changed` (health resets
 the provider's record). Recorded for the history and
 the system stream: `ultimate.started` (storage opened: generation, build), `subagents.started` (a subagent,
 automation run, new standing agent or branch configured: agent, model, thinking, parent), `board.sent` (a message
@@ -40,10 +41,19 @@ posted: ids, `reply`, `steer`, never the text), `workspaces.check` (each lander 
 outside the caller's commit (Pi's compaction, the machine's health file, an upload, a git repository), so each commits on
 its own right after it. For debugging what the user did: `user.input` (a typed prompt, steer or follow-up, an
 answer or dismissal, a review: its conversation, entry or message and length, never the text) and
-`ui.navigated` (the surface or Agent's conversation changed, reported by the browser after a second and deduped),
+`ui.navigated` (the surface or Agent's conversation changed, reported by the browser after a second and deduped) and
+`ui.changed` (core, `ChangedEvent` in `shared/events.ts`: stored UI state changed, in the commit that wrote it: a
+`/api/ui` key set or deleted, except `shell.*`, or an action's own write through `ctx.uiChanged(tx, …)`; with `key`,
+`value`, `previous` (a boolean, number or null as is, anything else as `"[value]"`) and `source` (`agent` or `person`,
+every write from a page an agent opened being the agent's); an unchanged value and the app's own writes record nothing; opening, closing,
+hover and focus are never stored, so never recorded; the System surface's UI changes tab, `extensions/ui`),
 each with the browser's `device` label and, through Tailscale Serve, the `login` and the client's tailnet `address`
 (`100.64.0.0/10` or `fd7a:115c:a1e0::/48`, for example `100.64.0.2`; any other forwarded address is dropped). UI
-action calls get the same `Device` as `ctx.device`. A `beforeInput` hook gets no device: it sees only the input entry
+action calls get the same `Device` as `ctx.device`, and `ctx.uiChanged(tx, …)` records a change with who made the
+call: `agent` for an agent's call on the server, or the page's `x-ultimate-source` header (`agent` while the page's
+agent bridge runs an `act`, `app` inside `writingAs('app', …)`, else `person`, or `agent` on a page an agent
+opened). A `/api/ui` op's own `who` overrides the header, so one page-exit request carries several writers. The page's claim is an attribution label, not a
+permission. A `beforeInput` hook gets no device: it sees only the input entry
 and runs for queued inputs too, so record the device from a UI action instead. A typed input and a review commit
 right after Pi admits them, which has no hook for queued inputs; answers commit with their reply. Something the user must see
 exactly once and that feeds the result the owner reports, like the lander waking a landed branch's starter, stays a
@@ -56,7 +66,7 @@ each such watcher says so in a comment above it. Do not invent an event only to 
 ## Browser events
 
 The browser
-has an ephemeral `events` bus from `@/sdk`: it queues and replays nothing, catches and logs handler errors with the
+has an ephemeral `events` bus from `@/sdk/solid`: it queues and replays nothing, catches and logs handler errors with the
 channel while other handlers continue, and `on(channel, handler)` returns an unsubscribe; clean it up when its owner
 is removed.
 
@@ -65,15 +75,16 @@ bus. In a web component, use
 `useEvent(channel, handler)` to subscribe for its mount and always call the latest handler:
 
 ```tsx
-import { events, useEvent, useReady } from '@/sdk'
+import { Show } from 'solid-js'
+import { events, useEvent, useReady } from '@/sdk/solid'
 
 function Receiver() {
   useEvent('hello:selected', (data) => console.log(data))
-  const { ready, timedOut, failed, pending } = useReady()
+  const ready = useReady()
   return (
     <span>
-      {ready ? 'Ready' : 'Loading'} {failed.join(', ')}
-      {timedOut && `Still loading: ${pending.join(', ')}`}
+      {ready().ready ? 'Ready' : 'Loading'} {ready().failed.join(', ')}
+      <Show when={ready().timedOut}>Still loading: {ready().pending.join(', ')}</Show>
     </span>
   )
 }
@@ -93,4 +104,4 @@ shows the surface and starts its shortcuts only once ready. In particular, root 
 facet is still loading; they need not wait for ready.
 A reload of a rendered page (a core restart, a switch to a new web bundle, F5) paints the previous page's view from
 `sessionStorage` before any module loads and fades it out once the app has rendered and settled
-(`web/src/sdk/resume.ts`); `resumed` from `@/sdk` is true on such a load, so a loading overlay can stay away.
+(`web/src/sdk/resume.ts`); `covered()` from `@/sdk/solid` is true while that picture still covers the page, so a loading overlay can stay away.

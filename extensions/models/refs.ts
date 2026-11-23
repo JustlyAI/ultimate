@@ -17,10 +17,10 @@ export type LoginFlow = {
   error?: string
 }
 
-/** The login flows started from a conversation, by flow id, on that conversation; finished ones are kept for a while. */
+/** The login flows by flow id, on the root conversation (logins are machine-wide); finished ones are kept for a while. */
 export const LoginDoc = docRef<{ flows: Record<string, LoginFlow> }>('models.login')
 
-/** `{ provider, type }` → `{ flowId }`: start logging in to `provider` for the calling conversation. */
+/** `{ provider, type }` → `{ flowId }`: start logging in to `provider`; its flow appears in `LoginDoc` on the root. */
 export const LoginAction = actionRef<{ provider: string; type: AuthType }, { flowId: string }>(
   'models',
   'login',
@@ -31,6 +31,15 @@ export const AnswerAction = actionRef<{ flowId: string; value: string }, null>('
 export const CancelAction = actionRef<{ flowId: string }, null>('models', 'cancel')
 /** `{ provider }` → null: remove the provider's stored credential, which Pi shares. */
 export const LogoutAction = actionRef<{ provider: string }, null>('models', 'logout')
+/**
+ * null → `{ errors }`: fetch every provider's model catalog from pi.dev now, as `pi update --models` does, so a model
+ * released after the installed Pi shows up without an npm release. `errors` maps each provider whose fetch failed to
+ * its message.
+ */
+export const RefreshCatalogAction = actionRef<null, { errors: Record<string, string> }>(
+  'models',
+  'refreshCatalog',
+)
 
 /**
  * A `models.fallback` entry: the conversation's model (`provider/id`) had no login here, so its next run switched to

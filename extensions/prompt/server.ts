@@ -215,7 +215,7 @@ export default function prompt(host: ExtensionHost) {
   return defineExtension({
     name: 'prompt',
     hooks: [
-      // Pi upstream: @earendil-works/pi-durable@1.5.2 — patched transactional beforeInput hook.
+      // Pi upstream: @earendil-works/pi-durable@1.6.0 — patched transactional beforeInput hook.
       hook(GenerationTask, {
         beforeInput: async function cachePreservingInputNote(_input, { tx, conversationId }) {
           const build = host.build()
@@ -295,11 +295,11 @@ export default function prompt(host: ExtensionHost) {
             ') and test new behaviour before relying on it. An "Instructions changed" or "Docs changed" line means those files changed: your system prompt already carries changed instructions; re-read changed docs before relying on them.',
         ].join('\n')
       }),
-      // Pi upstream: @earendil-works/pi-coding-agent@1.5.2 src/core/system-prompt.ts and src/core/tools/*.ts — copied tool guidance adapted from unexported prompt contributions. Drop when Pi exports buildSystemPromptSections and the per-tool system prompt contributions.
+      // Pi upstream: @earendil-works/pi-coding-agent@1.6.0 src/core/system-prompt.ts and src/core/tools/*.ts — copied tool guidance adapted from unexported prompt contributions. Drop when Pi exports buildSystemPromptSections and the per-tool system prompt contributions.
       section('tools', (input) => {
         const guidance: Record<string, string> = {
           read: '- read: inspect files, with offset/limit for large files.',
-          bash: '- bash: run commands, tests, builds, git, and searches (rg, find, ls). Long output is truncated; the full output is saved to a file you can read. To wait or poll (CI, deploys, a server or file appearing), use interruptible: true so a steering message ends it early; keep each sleep at 30 s or less per check, and never wait in the same call as a command that changes things.',
+          bash: "- bash: run commands, tests, builds, git, and searches (rg, find, ls). Each call starts in your work checkout, so commands can use paths relative to it. Long output is truncated; the full output is saved to a file you can read. To wait or poll (CI, deploys, a server or file appearing), use interruptible: true so a steering message ends it early; keep each sleep at 30 s or less per check, and never wait in the same call as a command that changes things. Start servers and other long-running processes with background: true and stop them with the kill command it returns; never stop a process you did not start, and never find one by name or port (pkill, fuser -k, lsof, ss): that kills other branches' servers or Ultimate itself.",
           edit: '- edit: change existing files with precise replacements. Each edits[].oldText must match the file exactly and be unique; keep it small. Put several changes to one file into one call; edits are matched against the original file, so never overlap them. After "Could not find", read the region again before retrying; after "Found N occurrences", widen oldText with surrounding lines.',
           write: '- write: create new files or rewrite one completely.',
         }

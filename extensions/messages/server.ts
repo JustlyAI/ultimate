@@ -21,7 +21,7 @@ import type { ActionContext } from '../../server/actions.ts'
 import type { ExtensionHost } from '../../server/extensions.ts'
 import { Branches, WorkspacesApi } from '../workspaces/api.ts'
 import { Standing, SubagentsApi } from '../subagents/api.ts'
-import { LineageApi } from '../lineage/api.ts'
+import { LineageApi, Replies } from '../lineage/api.ts'
 import { Messages, MessagesApi } from './api.ts'
 import { gist, openQuestion, openQuestionsNote, questionsParameter } from './questions.ts'
 import { callerOf } from './caller.ts'
@@ -31,19 +31,27 @@ import { implementAction } from '../../lib/actions.ts'
 import { isOwed } from '../../lib/message-state.ts'
 import { actingAs } from '../../lib/acting-as.ts'
 import { imagesParameter, SCAN_PAGE } from './images.ts'
-import { owed, parentOf, Started, starterOf, stillServedAfter } from './addresses.ts'
-import { delivery } from './delivery.ts'
-import { notice } from './notice.ts'
+import { owed, parentOf, Serving, Started, starterOf } from './addresses.ts'
+import { Concluded } from '../conversations/api.ts'
+import { dropped } from './outcomes.ts'
+import { delivery, reconcileOutputs, retireOutput, settle, submitOutput } from './delivery.ts'
 import { receiptOf, send } from './send.ts'
 import type { Device } from '../../shared/events.ts'
 import type { Context } from '@earendil-works/chord/context'
-import { answerRemoteRequest, reported, route, working } from './route.ts'
-import { projectsSection, remoteAction, remoteReplyAction, tell } from './remote.ts'
+import { branchesConcluded, reported, route, working } from './route.ts'
+import {
+  dismissTell,
+  projectsSection,
+  remoteAction,
+  remoteReplyAction,
+  tellTask,
+  tell,
+} from './remote.ts'
 import { branchTool } from './branch.ts'
 import { remoteProgress } from './progress.ts'
 import { safeToRerun } from '../../lib/replay.ts'
 export { gist, openQuestionsNote } from './questions.ts'
-export const docs = [Messages, Started]
+export const docs = [Messages, Started, Serving]
 
 async function openMessage(host: ExtensionHost, messageId: number, ctx: Context) {
   const log = await host.harness().snapshot(Messages, ROOT_CONVERSATION_ID, ctx)
@@ -176,6 +184,11 @@ export const actions = {
       (await actingAs(host, conversationId, ctx)) !== primary
     )
       throw new Error("Only @ultimate settles the user's questions")
+    const log = await host.harness().snapshot(Messages, ROOT_CONVERSATION_ID, ctx)
+    if (log?.messages.some((m) => m.id === messageId && m.to === 'remote')) {
+      if (!closing) throw new Error('A request to another project closes only with dismiss: true')
+      return { id: await dismissTell(host, primary, messageId as number, text.trim(), ctx) }
+    }
     const entry = await userRunInput(host, conversationId, ctx)
     const via = { conversation: conversationId, ...(entry === undefined ? {} : { entry }) }
     return {
@@ -211,10 +224,44 @@ export default function messages(host: ExtensionHost) {
   host.need(LineageApi)
   host.need(SubagentsApi)
   host.need(WorkspacesApi)
+  host.onOpen(() => host.harness().commit((tx) => reconcileOutputs(host, tx), BACKGROUND_CONTEXT))
+
+  host.react(
+    'branch-owner-concluded',
+    [Concluded],
+    async (tx, event) => {
+      if (!Concluded.is(event)) return
+      await branchesConcluded(host, tx, event.data.conversations, event.data.by, event.id)
+    },
+    { from: 'now' },
+  )
 
   host.implement(Branches, {
     starter: (id, ctx) => starterOf(host, id, ctx),
     working: (tx, id) => working(tx, id),
+    reserveLanding: async (tx, id, result) => {
+      const { owners } = await tx.doc(Serving, ROOT_CONVERSATION_ID)
+      const reservation = `landing:${result}` as const
+      for (const { owner, pending } of Object.values(owners))
+        if (owner.kind === 'branch' && owner.id === id && !pending.includes(reservation))
+          pending.push(reservation)
+    },
+    retireLanding: async (tx, result) => {
+      const by = (await tx.doc(Standing, ROOT_CONVERSATION_ID)).ultimate
+      if (by !== undefined)
+        await retireOutput(host, tx, by, `landing:${result}`, 'The landing card was not delivered')
+    },
+    submitLanding: async (tx, to, input, id, result) => {
+      await submitOutput(host, tx, to, input, { kind: 'branch', id }, `#${id}`, `landing:${result}`)
+    },
+  })
+  host.implement(Replies, {
+    replied: async (from, to, entry, ctx) =>
+      Boolean(
+        (await host.harness().snapshot(Messages, ROOT_CONVERSATION_ID, ctx))?.messages.some(
+          (m) => m.from === from && m.to === to && m.answer === entry,
+        ),
+      ),
   })
   host.implement(MessagesApi, {
     answer: (messageId, text, ctx, device, call) =>
@@ -229,19 +276,18 @@ export default function messages(host: ExtensionHost) {
       ),
     dismiss: (messageId, ctx, device, call) => dismiss(host, messageId, ctx, { device, call }),
     send: (from, input, requestId, ctx) => send(host, from, input, ctx, { requestId }),
-    tell: (from, input, ctx, signal) => tell(host, from, input, ctx, signal),
-    owed,
-    dropped: async (tx, by, serves, why, fired) => {
-      if (serves.from === 'remote' && !(await stillServedAfter(tx, serves, fired)))
-        await answerRemoteRequest(host, tx, by, serves, why, undefined, undefined, true)
-    },
+    tell: (from, input, ctx) => tell(host, from, input, ctx),
+    owed: (tx, to, automation) => owed(host, tx, to, automation),
+    submitFire: (tx, to, input, { id, name }) =>
+      submitOutput(host, tx, to, input, { kind: 'automation', id }, `automation ${id} "${name}"`),
+    dropped: (tx, id, source, why) => dropped(host, tx, { kind: 'automation', id }, source, why),
   })
   return defineExtension({
     name: 'messages',
-    tasks: [delivery(host), route(host), notice(host)],
+    tasks: [delivery(host), route(host), settle(host), tellTask(host)],
     hooks: [
       hook(GenerationTask, {
-        // Pi upstream: @earendil-works/pi-durable@1.5.2 — patched transactional beforeInput hook.
+        // Pi upstream: @earendil-works/pi-durable@1.6.0 — patched transactional beforeInput hook.
         beforeInput: (_input, api) => openQuestionsNote(api.tx, api.conversationId, Date.now()),
         onYield: async (_answer, api, ctx) => {
           let by = (await api.snapshot(Started, api.conversationId, ctx))?.by
@@ -287,8 +333,8 @@ export default function messages(host: ExtensionHost) {
         const upward =
           starter === undefined
             ? ''
-            : ` #${starter} started you: when you stop with nothing under way (no subagent, landing or reply pending), your final answer goes to it and wakes it; while work is under way it arrives as a note, and so do your one-way messages to it.`
-        return `Use message to contact #id or @name. @ultimate and branches may message user. Messages wake their recipient; its answer returns as a reply and wakes you. End your turn instead of waiting. A one-way message (reply: false) gets no answer; use reply: true when you need one. Inputs identify their sender; answer here and your answer is sent to the sender automatically; do not use message to reply. A message to an agent whose message you still owe an answer becomes that answer and ends your run; use it only to attach images.${upward}\n${agents.map((a) => `@${a.name} — ${a.description}`).join('\n')}`
+            : ` #${starter} started you: when you stop with nothing under way (no subagent, landing or reply pending), your final answer goes to it and wakes it; while work is under way, or when the run answered only the user's own input, it arrives as a note, and so do your one-way messages to it.`
+        return `Use message to contact #id or @name. Any conversation except a subagent may message user. Messages wake their recipient; its answer returns as a reply and wakes you. End your turn instead of waiting. A one-way message (reply: false) gets no answer; use reply: true when you need one. Inputs identify their sender; answer here and your answer is sent to the sender automatically; do not use message to reply. A message to an agent whose message you still owe an answer becomes that answer and ends your run; use it only to attach images.${upward}\n${agents.map((a) => `@${a.name} — ${a.description}`).join('\n')}`
       }),
 
       section('projects', async (input, ctx) => {
@@ -380,7 +426,11 @@ export default function messages(host: ExtensionHost) {
             await Promise.all(
               inputs.map(async (s) => (await host.harness().submission(s, ctx))?.status(ctx)),
             )
-          ).flatMap((s) => (s?.type === 'input' && s.entry !== undefined ? [s.entry] : []))
+          ).flatMap((s) =>
+            s?.type === 'input' && s.entry !== undefined
+              ? [{ entry: s.entry, submission: s.id }]
+              : [],
+          )
           const hasPendingReplies = await host
             .harness()
             .commit(

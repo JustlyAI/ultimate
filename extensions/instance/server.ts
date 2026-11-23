@@ -2,6 +2,7 @@ import type { ConversationId, ToolExecutionApi, JsonObject } from '@earendil-wor
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import {
   cp,
+  lstat,
   mkdtemp,
   mkdir,
   readdir,
@@ -15,7 +16,7 @@ import {
   writeFile,
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { basename, join, resolve as resolvePath } from 'node:path'
+import { basename, dirname, isAbsolute, join, resolve as resolvePath } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import type { Context } from '@earendil-works/chord/context'
 import { int, nullable, obj, opt, str } from '@earendil-works/pi-schema'
@@ -27,11 +28,11 @@ import { Subagents } from '../subagents/api.ts'
 import { TailscaleApi } from '../tailscale/api.ts'
 import { WorkspacesApi } from '../workspaces/api.ts'
 import type { WorkspaceService } from '../workspaces/api.ts'
-import { cleanPreview, sweepPreviews } from './cleanup.ts'
+import { cleanPreview, makeOwnerWritable, sweepPreviews } from './cleanup.ts'
 import { implementAction } from '../../lib/actions.ts'
 import { git, isolatable } from '../../lib/git.ts'
-import { meansNone, overshadowed } from '../../lib/errors.ts'
-import { spawnGroup, stopGroup } from '../../lib/process-group.ts'
+import { ignoring, isMissing, rebuiltOnOpen, meansNone, overshadowed } from '../../lib/errors.ts'
+import { spawnGroup, stopGroup, sweepPidFiles } from '../../lib/process-group.ts'
 import { within } from '../../lib/timers.ts'
 import type { Group, GroupProcess } from '../../lib/process-group.ts'
 import { Previews } from '../conversations/api.ts'
@@ -86,24 +87,33 @@ const PRIVATE_CONFIG_COPIES = [
   'claude-accounts.json',
   'agents',
   'skills',
+  'extensions',
 ]
-const SHARED_CODE_AND_REGISTRY = ['extensions', 'tailscale.json']
 
 export async function seedUserHome(from: string, to: string) {
   const source = join(from, '.ultimate')
-  const target = join(to, '.ultimate')
-  await mkdir(target, { recursive: true, mode: 0o700 })
-  const missing = (error: NodeJS.ErrnoException) => {
-    if (error.code !== 'ENOENT') throw error
+  await mkdir(dirname(to), { recursive: true })
+  const staging = await mkdtemp(`${to}.seed-`)
+  const target = join(staging, '.ultimate')
+  try {
+    await mkdir(target, { mode: 0o700 })
+    for (const name of PRIVATE_CONFIG_COPIES) {
+      if (!(await lstat(join(source, name)).catch(ignoring(isMissing)))) continue
+      await cp(join(source, name), join(target, name), {
+        recursive: true,
+        dereference: true,
+        errorOnExist: true,
+        force: false,
+      })
+    }
+    await makeOwnerWritable(target)
+    await symlink(join(source, 'tailscale.json'), join(target, 'tailscale.json'))
+    await rename(staging, to)
+  } catch (error) {
+    await makeOwnerWritable(staging)
+    await rm(staging, { recursive: true, force: true })
+    throw error
   }
-  for (const name of PRIVATE_CONFIG_COPIES)
-    await cp(join(source, name), join(target, name), {
-      recursive: true,
-      dereference: true,
-      errorOnExist: true,
-      force: false,
-    }).catch(missing)
-  for (const name of SHARED_CODE_AND_REGISTRY) await symlink(join(source, name), join(target, name))
 }
 
 export async function linkHome(from: string, to: string) {
@@ -202,9 +212,13 @@ interface Instance {
   conversationId?: ConversationId
   child: GroupProcess
   group: Group
+  pidFile: string
   output: string
   stopping?: RetryableStopInFlight
 }
+
+const previewPids = (home: string) => join(home, 'preview-pids')
+const startedByThisProcess = (name: string) => name.startsWith(`${process.pid}-`)
 
 const info = ({ id, url, home, pid, conversationId }: Instance) => ({
   id,
@@ -274,7 +288,11 @@ function stop(instances: Map<string, Instance>, id: string) {
 async function stopInstance(instances: Map<string, Instance>, instance: Instance) {
   const unreapedGroupLeaderPid = instance.child.pid
   if (unreapedGroupLeaderPid !== undefined)
-    await stopGroup(unreapedGroupLeaderPid, { leader: instance.group, grace: 5000 })
+    await stopGroup(unreapedGroupLeaderPid, {
+      leader: instance.group,
+      grace: 5000,
+      pidFile: instance.pidFile,
+    })
   if (instance.temporary) {
     await unlink(join(instance.home, 'ultimate.lock')).catch((error: NodeJS.ErrnoException) => {
       if (error.code !== 'ENOENT') throw error
@@ -375,9 +393,15 @@ export default function instanceExtension(
   const starts = host.resource('instance.starts', () => ({ pending: 0 }))
   const projectIsUltimateSource = host.projectRoot === host.ultimateRoot
   host.onOpen(async () => {
-    void sweepPreviews(tmpdir(), host.notice).catch((error: unknown) => {
-      host.notice(`Preview sweep failed: ${String(error)}`)
+    await sweepPidFiles(previewPids(host.home), startedByThisProcess).catch((error: unknown) => {
+      host.notice(`Stopping previews a crash left running failed: ${String(error)}`)
     })
+    rebuiltOnOpen(
+      'every open sweeps preview directories again',
+      sweepPreviews(tmpdir(), host.notice).catch((error: unknown) => {
+        host.notice(`Preview sweep failed: ${String(error)}`)
+      }),
+    )
   })
   async function start(
     args: { home?: string; model?: string | null },
@@ -389,6 +413,10 @@ export default function instanceExtension(
     let pendingHome: string | undefined
     try {
       context.abortSignal?.throwIfAborted()
+      if (args.home !== undefined && !isAbsolute(args.home))
+        throw new Error(
+          `home must be an absolute path, got ${JSON.stringify(args.home)}: "~" is not expanded, so build it from $HOME`,
+        )
       if ([...instances.values()].filter(live).length + starts.pending >= 3)
         throw new Error('At most three instances may run at once')
       starts.pending++
@@ -431,6 +459,12 @@ export default function instanceExtension(
       const userHome = join(home, 'user')
       const reusedHomeAlreadyHasPrivateConfig = existsSync(userHome)
       if (!reusedHomeAlreadyHasPrivateConfig) await seedUserHome(host.userHome, userHome)
+      else if (
+        (await lstat(join(userHome, '.ultimate/extensions')).catch(meansNone))?.isSymbolicLink()
+      )
+        throw new Error(
+          `${home} links the live user extensions (seeded by an older Ultimate); start on a fresh home`,
+        )
       await linkHome(host.userHome, userHome)
       const env = previewEnv(process.env, {
         home,
@@ -441,10 +475,13 @@ export default function instanceExtension(
           args.model === undefined ? await previewModelSetting(host) : (args.model ?? undefined),
         git: await previewGit(project, home),
       })
+      await mkdir(previewPids(host.home), { recursive: true })
+      const pidFile = join(previewPids(host.home), `${process.pid}-${randomUUID()}.pid`)
       const group = spawnGroup(process.execPath, ['server/main.ts'], {
         cwd,
         env,
         grace: 5000,
+        pidFile,
       })
       const { child } = group
       const id = randomUUID()
@@ -457,6 +494,7 @@ export default function instanceExtension(
         conversationId,
         child,
         group,
+        pidFile,
         output: '',
       }
       instances.set(id, item)

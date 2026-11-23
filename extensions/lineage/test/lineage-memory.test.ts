@@ -9,11 +9,10 @@ import {
   defineExtension,
   ROOT_CONVERSATION_ID,
 } from '@earendil-works/pi-durable'
-import { afterAll, beforeAll, expect, it } from 'vitest'
-import { applyMemoryOps, Memory, MEMORY_LIMIT } from '../memory.ts'
-import { Seen } from '../catchup.ts'
-import { abstract, Tally } from '../server.ts'
-import { Roots } from '../api.ts'
+import { afterEach, beforeAll, expect, it } from 'vitest'
+import { applyMemoryOps, MEMORY_LIMIT } from '../memory.ts'
+import { abstract } from '../server.ts'
+import { Memory, Roots, Tally } from '../api.ts'
 import { estimateTextTokens } from '@earendil-works/pi-ai/utils/estimate'
 import { Standing } from '../../subagents/api.ts'
 import { context } from '../../../server/harness.ts'
@@ -37,8 +36,8 @@ beforeAll(async () => {
 })
 type Server = Awaited<ReturnType<typeof fauxServer>>
 const servers: Server[] = []
-afterAll(async () => {
-  await Promise.all(servers.splice(0).map((server) => server.close()))
+afterEach(async () => {
+  for (const server of servers.splice(0)) await server.close()
 })
 
 const textOf = (content: unknown) =>
@@ -115,7 +114,7 @@ const run = async (server: Server, name: string, args: object, caller: number) =
   return textOf(result.output)
 }
 
-it.concurrent('applies memory ops atomically and holds the cap', async () => {
+it('applies memory ops atomically and holds the cap', async () => {
   const { server } = await fixture()
   expect(await apply(server, [add('pnpm'), add('node')])).toBe("Added pnpm, node in #1's memory.")
   expect(
@@ -165,7 +164,7 @@ it.concurrent('applies memory ops atomically and holds the cap', async () => {
   expect(after['m-0']).toBeUndefined()
 })
 
-it.concurrent('starts a branch from the memory brief, and without memories from the tally', async () => {
+it('starts a branch from the memory brief, and without memories from the tally', async () => {
   const { server } = await fixture()
   // Without memories a branch inherits the tally, as before.
   const plain = await branch(server, 'Plain branch')
@@ -178,10 +177,6 @@ it.concurrent('starts a branch from the memory brief, and without memories from 
   expect(JSON.stringify((await inherited.conversation.context(context)).messages)).toContain(marker)
 
   await apply(server, [add('pnpm', 'Use pnpm for everything')])
-  const tip = (await server.harness.commit(
-    async (tx) => (await tx.scanEntries({ conversationId: ROOT_CONVERSATION_ID }, 1)).items[0].id,
-    context,
-  )) as number
   const briefed = await branch(server, 'Briefed branch')
   const view = await briefed.conversation.context(context)
   const said = view.messages.filter((message) => message.role !== 'system')
@@ -194,11 +189,7 @@ it.concurrent('starts a branch from the memory brief, and without memories from 
   expect(textOf(said[2].content)).toBe('Briefed branch')
   expect(JSON.stringify(view.messages)).not.toContain(marker)
   expect(view.entries[0]).toMatchObject({ kind: 'pi.reset' })
-  // Catch-up starts after the root's tip at the fork, not from the tally's start.
-  const seen = await server.harness.snapshot(Seen, briefed.id, context)
-  expect(seen?.tally).toBeGreaterThanOrEqual(tip)
-  // The brief records the root tip it covers, for forks of this branch.
-  expect(view.entries[0]).toMatchObject({ data: { lineage: { brief: { tally: tip } } } })
+  expect(view.entries[0]).toMatchObject({ data: { lineage: { brief: true } } })
   // The root's footer counts the brief a branch receives, recounted when memory changes.
   const briefTokens = async () =>
     (await server.harness.snapshot(Tally, ROOT_CONVERSATION_ID, context))?.briefTokens
@@ -214,35 +205,11 @@ it.concurrent('starts a branch from the memory brief, and without memories from 
   ).toContain("starts with your project's memory index")
 })
 
-it.concurrent('forks of a briefed branch inherit the tally tip its brief covers', async () => {
-  const { server } = await fixture()
-  const older = (await server.harness.commit(
-    async (tx) => (await tx.scanEntries({ conversationId: ROOT_CONVERSATION_ID }, 1)).items[0].id,
-    context,
-  )) as number
-  await branch(server, 'Moves the root on')
-  await apply(server, [add('pnpm')])
-  const b = await branch(server, 'Briefed from an older entry', 1, older)
-  const [reset] = (await b.conversation.context(context)).entries
-  const briefTip = (reset.data as { lineage: { brief: { tally: number } } }).lineage.brief.tally
-  expect(briefTip).toBeGreaterThan(older)
-  // C's tally position is B's brief tip, so its catch-up does not report the branch the brief already covered.
-  const c = await branch(server, 'Fork of the briefed branch', b.id)
-  const notes = (
-    await server.harness.commit(
-      async (tx) =>
-        (await tx.scanEntries({ conversationId: c.id, minEntryId: reset.id }, 50)).items,
-      context,
-    )
-  ).filter((entry) => entry.kind === 'lineage.note')
-  expect(JSON.stringify(notes)).not.toContain('Moves the root on')
-  expect((await server.harness.snapshot(Seen, c.id, context))?.tally).toBeGreaterThan(briefTip)
-})
-
-it.concurrent('reads memories with memory; only @ultimate writes them with remember', async () => {
+it('reads memories with memory; only @ultimate writes them with remember', async () => {
   const { server } = await fixture()
   const { id } = await branch(server, 'Reader')
   expect(await run(server, 'memory', {}, id)).toBe('#1 has no memories yet.')
+  expect(await run(server, 'memory', { query: 'anything' }, id)).toBe('#1 has no memories yet.')
   // A branch finds the deferred tool with tool_search, so the call itself is refused.
   await expect(run(server, 'remember', { ops: [add('pnpm')] }, id)).rejects.toThrow(
     'Only @ultimate writes project memory',
@@ -277,7 +244,15 @@ it.concurrent('reads memories with memory; only @ultimate writes them with remem
   expect(await run(server, 'memory', { read: 'lint' }, id)).toMatch(
     /^lint \[fact\] — About lint \(updated [\d-]+\)\nSource: #2\/3\n\nAbout lint, in full\.$/,
   )
-  await expect(run(server, 'memory', { read: 'nope' }, id)).rejects.toThrow('no memory nope')
+  // An unknown slug, say one deleted since the caller saw it, answers with the index instead of failing.
+  const stale = await run(server, 'memory', { read: ['lint', 'pnpm', 'nope'] }, id)
+  expect(stale).toMatch(
+    /^lint \[fact\][^]*About lint, in full\.\n\n---\n\npnpm \[fact\][^]*About pnpm, in full\.\n\n#1 has no memory nope\. #1's memory \(2\):\n/,
+  )
+  // Without the classify extension a query answers with the index.
+  expect(await run(server, 'memory', { query: 'which package manager' }, id)).toMatch(
+    /^Memory search is unavailable \([^)]+\); the index instead:\n#1's memory \(2\):/,
+  )
   // The user's forget goes through the same write path.
   const forgot = await post(server, '/api/extensions/lineage/actions/forget', {
     args: { root: 1, slug: 'lint' },
@@ -304,7 +279,7 @@ it.concurrent('reads memories with memory; only @ultimate writes them with remem
   )
 })
 
-it.concurrent('ends a compaction of @ultimate with its project memory', async () => {
+it('ends a compaction of @ultimate with its project memory', async () => {
   const { server, state } = await fixture()
   await apply(server, [add('kept-fact', 'The project keeps this fact')])
   const ultimate = await server.harness.createConversation(
@@ -335,7 +310,7 @@ it.concurrent('ends a compaction of @ultimate with its project memory', async ()
   )
 })
 
-it.concurrent('wakes @ultimate once after its manual compaction, never after an automatic one', async () => {
+it('wakes @ultimate once after its manual compaction, never after an automatic one', async () => {
   const { server, state } = await fixture()
   const ultimate = await server.harness.createConversation(
     { ownership: { kind: 'ownerless' } },
@@ -405,6 +380,14 @@ it.concurrent('wakes @ultimate once after its manual compaction, never after an 
   const asked = state.condensed.length
   const stale = await ultimate.compact(undefined, context)
   await until(() => state.condensed.length > asked)
+  // It waits on the compaction without holding an invocation.
+  await until(async () =>
+    (await wakeTasks()).some(
+      (task) =>
+        (task.input as { compaction: number }).compaction === stale &&
+        task.state.status === 'waiting',
+    ),
+  )
   await ultimate.reset(undefined, context)
   release.resolve()
   await server.harness.waitForTask(stale, context)
@@ -416,7 +399,7 @@ it.concurrent('wakes @ultimate once after its manual compaction, never after an 
   expect(await kinds()).toEqual(['pi.reset'])
 })
 
-it.concurrent('lets any conversation compact itself with the tool and wakes it to continue', async () => {
+it('lets any conversation compact itself with the tool and wakes it to continue', async () => {
   const { server } = await fixture()
   const other = await server.harness.createConversation(
     { ownership: { kind: 'ownerless' } },

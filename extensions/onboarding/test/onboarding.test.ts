@@ -10,7 +10,7 @@ import { projectDecision } from '../../../lib/project-setup.ts'
 import { updateSettings } from '../../../lib/settings.ts'
 import { ProjectTrustStore } from '@earendil-works/pi-coding-agent'
 
-it.concurrent('gates project resources, remembers choices, and applies onboarding settings actions live', async () => {
+async function setupFixture(decision?: boolean) {
   const home = await temp('ultimate-onboarding-')
   const project = join(home, 'project')
   const config = join(project, '.ultimate')
@@ -23,7 +23,7 @@ it.concurrent('gates project resources, remembers choices, and applies onboardin
     join(config, 'extensions/x/server.ts'),
     "import { defineExtension } from '@earendil-works/pi-durable'; export default defineExtension({ name: 'x' })",
   )
-  await writeFile(join(config, 'extensions/x/web.tsx'), 'export default {}')
+  await writeFile(join(config, 'extensions/x/web.solid.tsx'), 'export default {}')
   await writeFile(
     join(config, 'extensions/x/README.md'),
     '# X\n\nA local extension. Another sentence.',
@@ -45,6 +45,7 @@ it.concurrent('gates project resources, remembers choices, and applies onboardin
       extensions: { disable: ['plan'], extra: 'keep' },
     }),
   )
+  if (decision !== undefined) new ProjectTrustStore(join(home, '.ultimate')).set(project, decision)
   const options = {
     ultimateRoot: resolve('.'),
     projectRoot: project,
@@ -53,18 +54,29 @@ it.concurrent('gates project resources, remembers choices, and applies onboardin
     localSetup: false,
     firstRun: true,
   }
+  return { home, project, projectFile, userFile, options }
+}
+
+function drive(server: Awaited<ReturnType<typeof fauxServer>>) {
+  return {
+    action: async (name: string, args: unknown = {}) => {
+      const response = await post(server, `/api/extensions/onboarding/actions/${name}`, { args })
+      expect(response.status).toBe(200)
+      return response.data.result
+    },
+    enabled: (name: string) =>
+      server.extensions.info().find((entry) => entry.name === name)?.enabled,
+    web: async () => server.web.facets(),
+    tools: async () => (await server.root.agent(context)).tools.map((tool) => tool.name),
+  }
+}
+
+it('gates project resources until the local setup is chosen, and remembers the choice', async () => {
+  const { home, project, options } = await setupFixture()
   let server: Awaited<ReturnType<typeof fauxServer>> | undefined
   try {
     server = await fauxServer(options)
-    const action = async (name: string, args: unknown = {}) => {
-      const response = await post(server!, `/api/extensions/onboarding/actions/${name}`, { args })
-      expect(response.status).toBe(200)
-      return response.data.result
-    }
-    const enabled = (name: string) =>
-      server!.extensions.info().find((entry) => entry.name === name)?.enabled
-    const web = async () => server!.web.facets()
-    const tools = async () => (await server!.root.agent(context)).tools.map((tool) => tool.name)
+    const { action, enabled, web, tools } = drive(server)
     for (const args of [
       {},
       { extensions: { plan: 'yes' } },
@@ -126,19 +138,32 @@ it.concurrent('gates project resources, remembers choices, and applies onboardin
     expect(enabled('x')).toBe(true)
     expect(enabled('plan')).toBe(false)
     expect(await tools()).not.toContain('plan')
-    expect((await web()).some((path) => path.endsWith('/x/web.tsx'))).toBe(true)
+    expect((await web()).some((path) => path.endsWith('/x/web.solid.tsx'))).toBe(true)
     expect(server.system.current().skills.some((skill) => skill.name === 'local-skill')).toBe(true)
     expect(projectDecision(project, home)).toBe(true)
-    await server.close()
+    const first = server
+    server = undefined
+    await first.close()
     server = await fauxServer(options)
     expect(server.system.current().project.decision).toBe(true)
-    expect(enabled('x')).toBe(true)
+    expect(drive(server).enabled('x')).toBe(true)
+  } finally {
+    await server?.close()
+    await removeTemp(home)
+  }
+})
+
+it('applies extension choices live at project and user scope, keeping other settings', async () => {
+  const { home, projectFile, userFile, options } = await setupFixture(true)
+  const server = await fauxServer(options)
+  try {
+    const { action, enabled, web } = drive(server)
     await action('setExtension', { name: 'splash', enabled: false, scope: 'project' })
     expect(enabled('splash')).toBe(false)
-    expect((await web()).some((path) => path.endsWith('/splash/web.tsx'))).toBe(false)
+    expect((await web()).some((path) => path.endsWith('/splash/web.solid.tsx'))).toBe(false)
     await action('setExtension', { name: 'splash', enabled: true, scope: 'project' })
     expect(enabled('splash')).toBe(true)
-    expect((await web()).some((path) => path.endsWith('/splash/web.tsx'))).toBe(true)
+    expect((await web()).some((path) => path.endsWith('/splash/web.solid.tsx'))).toBe(true)
     const projectSettings = JSON.parse(await readFile(projectFile, 'utf8'))
     expect(projectSettings).toMatchObject({
       custom: { keep: 1 },
@@ -164,10 +189,10 @@ it.concurrent('gates project resources, remembers choices, and applies onboardin
     await rename(userFile + '.tmp', userFile)
     await action('setExtension', { name: 'sounds', enabled: true, scope: 'user' })
     expect(enabled('sounds')).toBe(true)
-    expect((await web()).some((path) => path.endsWith('/sounds/web.tsx'))).toBe(true)
+    expect((await web()).some((path) => path.endsWith('/sounds/web.solid.tsx'))).toBe(true)
     await action('setExtension', { name: 'sounds', enabled: false, scope: 'user' })
     expect(enabled('sounds')).toBe(false)
-    expect((await web()).some((path) => path.endsWith('/sounds/web.tsx'))).toBe(false)
+    expect((await web()).some((path) => path.endsWith('/sounds/web.solid.tsx'))).toBe(false)
     expect(JSON.parse(await readFile(userFile, 'utf8'))).toMatchObject({
       custom: 'user',
       extensions: { extra: 2, enable: [], disable: ['sounds'] },
@@ -178,11 +203,30 @@ it.concurrent('gates project resources, remembers choices, and applies onboardin
     expect(
       (await action('extensions')).find((entry: { name: string }) => entry.name === 'sounds').layer,
     ).toBe('user')
+  } finally {
+    await server.close()
+    await removeTemp(home)
+  }
+})
+
+it('withdraws the local setup, adopts it into user settings, and remembers the first run', async () => {
+  const { home, projectFile, userFile, options } = await setupFixture(true)
+  await updateSettings(projectFile, (value) => {
+    value.extensions = { ...(value.extensions as object), enable: ['splash'] }
+  })
+  await writeFile(
+    userFile,
+    JSON.stringify({ custom: 'user', extensions: { extra: 2, disable: ['sounds'] } }),
+  )
+  let server: Awaited<ReturnType<typeof fauxServer>> | undefined
+  try {
+    server = await fauxServer(options)
+    const { action, enabled, web, tools } = drive(server)
     await action('decide', { local: false })
     expect(enabled('x')).toBe(false)
     expect(enabled('plan')).toBe(true)
     expect(await tools()).toContain('plan')
-    expect((await web()).some((path) => path.endsWith('/x/web.tsx'))).toBe(false)
+    expect((await web()).some((path) => path.endsWith('/x/web.solid.tsx'))).toBe(false)
     expect(server.system.current().skills.some((skill) => skill.name === 'local-skill')).toBe(false)
     const adoptDenied = await post(server, '/api/extensions/onboarding/actions/adoptProjectSetup', {
       args: {},
@@ -207,18 +251,20 @@ it.concurrent('gates project resources, remembers choices, and applies onboardin
     expect(await action('status')).toMatchObject({ firstRun: true, off: false })
     await action('firstRunDone')
     expect((await action('status')).firstRun).toBe(false)
-    await server.close()
+    const first = server
+    server = undefined
+    await first.close()
     server = await fauxServer(options)
     expect(server.system.current().project.decision).toBe(false)
-    expect(enabled('x')).toBe(false)
-    expect((await action('status')).firstRun).toBe(false)
+    expect(drive(server).enabled('x')).toBe(false)
+    expect((await drive(server).action('status')).firstRun).toBe(false)
   } finally {
     await server?.close()
     await removeTemp(home)
   }
 })
 
-it.concurrent('offers setup only to named definitions, refuses inapplicable cards, and deduplicates user-only choices', async () => {
+it('offers setup only to named definitions, refuses inapplicable cards, and deduplicates user-only choices', async () => {
   const home = await temp('ultimate-setup-cards-')
   const project = join(home, 'project')
   await mkdir(join(project, '.ultimate'), { recursive: true })
@@ -377,20 +423,22 @@ it.concurrent('offers setup only to named definitions, refuses inapplicable card
     expect(
       JSON.stringify(
         await run('codemode', {
-          code: `return await ultimate.action('onboarding', 'choose', ${JSON.stringify(choice)});`,
+          code: `return await tools.action({extension: 'onboarding', action: 'choose', args: ${JSON.stringify(choice)}});`,
         }),
       ),
     ).toContain('onboarding/choose is a user-only action')
     expect(
       JSON.stringify(
         await run('codemode', {
-          code: "return await ultimate.action('onboarding', 'start', {root: 1});",
+          code: "return await tools.action({extension: 'onboarding', action: 'start', args: {root: 1}});",
         }),
       ),
     ).toContain('onboarding/start is a user-only action')
     expect(
       JSON.stringify(
-        await run('codemode', { code: "return await ultimate.action('workspaces', 'setupGit');" }),
+        await run('codemode', {
+          code: "return await tools.action({extension: 'workspaces', action: 'setupGit'});",
+        }),
       ),
     ).toContain('workspaces/setupGit is a user-only action')
     // Absence is checked independently of the remembered project decision.
@@ -402,7 +450,7 @@ it.concurrent('offers setup only to named definitions, refuses inapplicable card
   }
 })
 
-it.concurrent('does not inherit a parent project choice', async () => {
+it('does not inherit a parent project choice', async () => {
   const home = await temp('ultimate-trust-')
   try {
     const project = join(home, 'parent/child')
@@ -414,7 +462,7 @@ it.concurrent('does not inherit a parent project choice', async () => {
   }
 })
 
-it.concurrent('shares one choice between a checkout and its linked worktrees', async () => {
+it('shares one choice between a checkout and its linked worktrees', async () => {
   const home = await temp('ultimate-trust-worktree-')
   try {
     const main = join(home, 'main')
@@ -450,7 +498,7 @@ it.concurrent('shares one choice between a checkout and its linked worktrees', a
   }
 })
 
-it.concurrent('boots with corrupt trust, discloses project replacements, and recovers after repair', async () => {
+it('boots with corrupt trust, discloses project replacements, and recovers after repair', async () => {
   const home = await temp('ultimate-corrupt-trust-')
   const project = join(home, 'project')
   await mkdir(join(project, '.ultimate/extensions/codemode'), { recursive: true })

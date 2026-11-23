@@ -1,7 +1,12 @@
 import { join } from 'node:path'
 import { fauxProvider, fauxAssistantMessage, fauxText } from '@earendil-works/pi-ai/providers/faux'
 import { configure, ROOT_CONVERSATION_ID } from '@earendil-works/pi-durable'
-import type { ConversationId, Tx } from '@earendil-works/pi-durable'
+import type {
+  Conversation,
+  ConversationId,
+  InputSubmissionDraft,
+  Tx,
+} from '@earendil-works/pi-durable'
 import type { JsonValue } from '@earendil-works/chord/json'
 import { afterEach, expect, it, vi } from 'vitest'
 import { context, prepareHarness } from '../../../server/harness.ts'
@@ -15,10 +20,11 @@ import { ContextUsageDoc } from '../../conversations/api.ts'
 import { Standing } from '../../subagents/api.ts'
 import type { SubagentsService } from '../../subagents/api.ts'
 import { createChild } from '../../subagents/children.ts'
+import { Workspaces } from '../../workspaces/workspaces.ts'
 import automations, { actions, Automations } from '../server.ts'
 import type { Automation } from '../types.ts'
-import { IDLE_TICK } from '../triggers.ts'
-import { temp, eventHost, until, apis } from '../../../test/helpers.ts'
+import { IDLE_WAKER } from '../triggers.ts'
+import { temp, eventHost, until, apis, openers } from '../../../test/helpers.ts'
 
 const closes: (() => Promise<void>)[] = []
 afterEach(async () => {
@@ -37,8 +43,7 @@ async function fixture() {
   let opened: OpenHost
   const events = eventHost(() => opened.harness, 'automations')
   const resources = new Map<string, unknown>()
-  let opener: () => Promise<void>
-  let closer: () => Promise<void>
+  const lifecycle = openers()
   let fail = false
   let rolledBack = false
   const send = vi.fn<() => Promise<object>>(async () => ({}))
@@ -60,14 +65,22 @@ async function fixture() {
       if (!resources.has(key)) resources.set(key, create())
       return resources.get(key)
     },
-    onOpen: (fn: () => Promise<void>) => {
-      opener = fn
-    },
-    onRelease: () => {},
-    onClose: (fn: () => Promise<void>) => {
-      closer = fn
-    },
-    ...apis(new Map<string, unknown>([['messages', { send, owed: async () => ({}) }]])),
+    onOpen: lifecycle.onOpen,
+    ...apis(
+      new Map<string, unknown>([
+        [
+          'messages',
+          {
+            send,
+            owed: async () => ({}),
+            dropped: async () => {},
+            submitFire: (tx: Tx, to: Conversation, input: InputSubmissionDraft) =>
+              to.submit(tx, input),
+          },
+        ],
+        ['workspaces', { doc: Workspaces }],
+      ]),
+    ),
     extensions: () => [{ name: 'subagents', enabled: true }],
     projectSetup: async () => ({ decision: false }),
     notice: (message: string) => {
@@ -75,6 +88,7 @@ async function fixture() {
     },
   }
   host.provided.set('subagents', {
+    residents: async () => [{ name: 'ultimate', description: '' }],
     // As the real one: the standing agent's conversation of the moment, the fixture's target before one is recorded.
     standing: async (name: string) =>
       name === 'ultimate'
@@ -96,11 +110,11 @@ async function fixture() {
     await configure(tx, child.id, {})
     return child.id
   }, context)
-  await opener!()
+  await lifecycle.open()
   await events.start()
   closes.push(async () => {
     await events.stop()
-    await closer!()
+    await lifecycle.close()
     await opened.close()
   })
   const action = (name: keyof typeof actions, args: JsonValue = {}) =>
@@ -135,8 +149,16 @@ async function fixture() {
     get harness() {
       return opened.harness
     },
-    opener: () => opener!(),
-    closer: () => closer!(),
+    opener: lifecycle.open,
+    closer: lifecycle.close,
+    reopen: async () => {
+      await events.stop()
+      await lifecycle.close()
+      await opened.close()
+      opened = await prepared.open()
+      await lifecycle.open()
+      await events.start()
+    },
     fail: () => {
       fail = true
     },
@@ -349,6 +371,9 @@ it('rolls back a fire and its cursor together, then retries exactly once', async
 it('uses context hysteresis and cooldown and catches a missed crossing on open once', async () => {
   vi.useFakeTimers({ toFake: ['Date'] })
   const f = await fixture()
+  await f.harness.commit(async (tx) => {
+    ;(await tx.doc(Standing, ROOT_CONVERSATION_ID)).ultimate = f.target
+  }, context)
   const a = (await f.action('create', {
     name: 'Context',
     condition: { metric: 'context', of: '@ultimate', above: 80 },
@@ -382,8 +407,7 @@ it('uses context hysteresis and cooldown and catches a missed crossing on open o
 })
 
 it('fires an idle condition only after the pause, at the threshold, and re-arms below the line', async () => {
-  // The minute look is an interval: faked, so a tick runs when the test says.
-  vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] })
+  vi.useFakeTimers({ toFake: ['Date'] })
   const f = await fixture()
   await f.harness.commit(async (tx) => {
     ;(await tx.doc(Standing, ROOT_CONVERSATION_ID)).ultimate = f.target
@@ -403,44 +427,61 @@ it('fires an idle condition only after the pause, at the threshold, and re-arms 
         f.host.emit(tx, UserInputEvent, { conversation: f.target, kind: 'prompt', length: 1 }),
       context,
     )
-  const tick = async () => {
-    // The minute look reads only the idle condition: it measures it again, and leaves the plain one as it was.
-    await f.harness.commit(async (tx) => {
-      const ledger = (await tx.doc(Automations)).automations
-      delete ledger[a.id].condition!.value
-      delete ledger[plain.id].condition!.value
-    }, context)
-    vi.advanceTimersByTime(IDLE_TICK)
-    await until(async () => (await f.record(a.id)).condition?.value !== undefined)
-    expect((await f.record(plain.id)).condition?.value).toBeUndefined()
+  const live = async () =>
+    (await f.harness.commit((tx) => tx.scanTasks({ kind: IDLE_WAKER }, 100), context)).items.filter(
+      (task) => task.state.status !== 'terminal',
+    )
+  const wakers = async () => {
+    await until(async () => (await live()).every((task) => task.state.status === 'sleeping'))
+    return live()
   }
-  // Above the threshold right away: no pause yet.
+  const later = async (ms: number) => {
+    vi.setSystemTime(Date.now() + ms)
+    f.harness.resume()
+    await wakers()
+  }
+  // Above the threshold right away: no pause yet, so it sleeps until 8 h after the automation was made.
+  const createdAt = Date.now()
   await f.usage(60)
   await until(async () => (await f.record(a.id)).condition?.value === 60)
   expect((await f.record(a.id)).fires).toBe(0)
-  // The user writes at 7 h; at 14 h (7 h after it) it is still silent, then time alone crosses 8 h.
-  vi.setSystemTime(Date.now() + 7 * HOUR)
+  expect((await wakers()).map((task) => task.state)).toMatchObject([
+    { status: 'sleeping', until: createdAt + 8 * HOUR },
+  ])
+  // The user writes at 7 h: the sleeper wakes at 8 h, sees the newer input and sleeps until 15 h.
+  await later(7 * HOUR)
   await input()
   await f.settle()
-  expect((await f.record(a.id)).condition?.inputAt).toBe(Date.now())
-  vi.setSystemTime(Date.now() + 7 * HOUR)
-  await tick()
+  const inputAt = Date.now()
+  expect((await f.record(a.id)).condition?.inputAt).toBe(inputAt)
+  await later(HOUR)
+  await until(async () =>
+    (await live()).some((task) => (task.input as { until: number }).until === inputAt + 8 * HOUR),
+  )
   expect((await f.record(a.id)).fires).toBe(0)
-  vi.setSystemTime(Date.now() + HOUR + 1)
-  await tick()
-  expect((await f.record(a.id)).fires).toBe(1)
+  expect((await wakers()).map((task) => task.state)).toMatchObject([
+    { status: 'sleeping', until: inputAt + 8 * HOUR },
+  ])
+  // The sleeper outlives a restart, then time alone crosses 8 h without input: one fire.
+  await f.reopen()
+  expect(await wakers()).toHaveLength(1)
+  await later(7 * HOUR - 1)
+  expect((await f.record(a.id)).fires).toBe(0)
+  await later(1)
+  await until(async () => (await f.record(a.id)).fires === 1)
   expect((await f.record(a.id)).condition?.armed).toBe(false)
-  // Disarmed: further pauses and ticks above the line do not fire again; dropping to 45% does not re-arm.
-  vi.setSystemTime(Date.now() + 9 * HOUR)
+  expect((await f.record(plain.id)).fires).toBe(0)
+  expect(await wakers()).toHaveLength(0)
+  // Disarmed: further pauses above the line do not fire again; dropping to 45% does not re-arm.
+  await later(9 * HOUR)
   await f.usage(45)
   await until(async () => (await f.record(a.id)).condition?.value === 45)
-  await tick()
   expect((await f.record(a.id)).condition?.armed).toBe(false)
   // Below 40% re-arms; past the pause but under the threshold stays silent.
   await f.usage(39)
   await until(async () => (await f.record(a.id)).condition?.armed === true)
-  await tick()
   expect((await f.record(a.id)).fires).toBe(1)
+  expect(await wakers()).toHaveLength(0)
   // Back over 50% after the pause: the second fire.
   await f.usage(51)
   await until(async () => (await f.record(a.id)).fires === 2)
@@ -454,6 +495,9 @@ it('fires an idle condition only after the pause, at the threshold, and re-arms 
 
 it('sees a re-arm and the crossing after it even when both commit before evaluation', async () => {
   const f = await fixture()
+  await f.harness.commit(async (tx) => {
+    ;(await tx.doc(Standing, ROOT_CONVERSATION_ID)).ultimate = f.target
+  }, context)
   const a = (await f.action('create', {
     name: 'Lagging',
     condition: { metric: 'context', of: '@ultimate', above: 80, cooldownMs: 0 },
@@ -512,6 +556,41 @@ it.each(floodTriggers)(
     expect((await f.record(a.id)).recentFires).toHaveLength(1)
   },
 )
+
+it('counts only fires that start a run toward the hourly cap', async () => {
+  vi.useFakeTimers({ toFake: ['Date'] })
+  const f = await fixture()
+  const a = (await f.action('create', {
+    name: 'Deploy',
+    prompt: 'Deploy',
+    schedule: 'every 1d',
+  })) as Automation
+  const busy = (status: 'running' | 'done') =>
+    f.harness.commit(async (tx) => {
+      const runs = (await tx.doc(Automations)).automations[a.id].runs
+      const run = runs.find((r) => r.id === 'busy')
+      if (run) run.status = status
+      else runs.push({ id: 'busy', firedAt: Date.now(), status })
+    }, context)
+  // A deploy still working: every fire beside it is skipped and starts nothing.
+  await busy('running')
+  for (let i = 0; i < 10; i++) await f.action('run', { id: a.id })
+  expect(await f.record(a.id)).toMatchObject({ fires: 10, enabled: true, recentFires: [] })
+  await busy('done')
+  const fireAndFinish = async () => {
+    await f.action('run', { id: a.id })
+    await until(async () => (await f.record(a.id)).runs.at(-1)!.status !== 'running')
+  }
+  for (let i = 0; i < 7; i++) await fireAndFinish()
+  const paused = await f.record(a.id)
+  expect(paused.enabled).toBe(false)
+  // The seventh real fire pauses instead of starting a run.
+  expect(paused.runs.filter((r) => r.status === 'done' && r.id !== 'busy')).toHaveLength(6)
+  expect(paused.runs.filter((r) => r.status === 'skipped')).toHaveLength(10)
+  expect(
+    (await f.host.eventLog.recent({ events: [defineEvent('automations.escalated')] }))[0].data,
+  ).toEqual({ id: a.id, reason: 'Fired more than 6 times in an hour; paused' })
+})
 
 it('lists ten event definitions and validates trigger inputs and kind changes', async () => {
   const f = await fixture()

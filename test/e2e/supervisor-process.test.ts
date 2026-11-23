@@ -141,6 +141,27 @@ process.on('message',(message:{type:string})=>{ if(message.type==='go')process.s
     expect(await received).toContain('200 OK')
   }, 60000)
 
+  it('stops restarting a core that keeps crashing soon after it is ready', async () => {
+    const home = await temp('ultimate-crash-loop-')
+    homes.push(home)
+    const root = await sourceCopy(home)
+    copies.set(home, root)
+    await writeFile(
+      join(root, 'server/main.ts'),
+      `import { createServer } from 'node:http'
+const server=createServer((_req,res)=>res.end('up'))
+server.listen(0,'127.0.0.1',()=>process.send?.({type:'prepared',port:(server.address() as import('node:net').AddressInfo).port}))
+process.on('message',(message:{type:string})=>{ if(message.type==='go'){process.send?.({type:'ready'});setTimeout(()=>void Promise.reject(new Error('background promise failed')),100)} })`,
+    )
+    const running = await launch(home)
+    await until(() => running.output().includes('failed · waiting for changes'))
+    expect(running.output().match(/exited unexpectedly/g)).toHaveLength(3)
+    const lock = JSON.parse(await readFile(join(home, 'ultimate.lock'), 'utf8'))
+    const page = await fetch(`http://127.0.0.1:${lock.port}`)
+    expect(page.status).toBe(503)
+    expect(await page.text()).toContain('background promise failed')
+  }, 60000)
+
   it('owns a random public port, refuses a second instance naming its pid, and accepts the public Origin', async () => {
     const first = await fixture()
     const second = await launch(first.home)
@@ -167,6 +188,16 @@ process.on('message',(message:{type:string})=>{ if(message.type==='go')process.s
     expect(
       (await post(first.url, '/api/conversations/1/configure', { thinkingLevel: 'off' })).status,
     ).toBe(200)
+  }, 60000)
+  it('keeps a supervised core running when a process outside the supervisor sends it SIGTERM', async () => {
+    const running = await fixture()
+    const stream = await attach(running.url)
+    const pid = stream.system().process.pid
+    process.kill(pid, 'SIGTERM')
+    await until(() => running.output().includes(`Ignored SIGTERM sent to core pid ${pid}`))
+    expect(running.output()).not.toContain('exited unexpectedly')
+    expect((await fetch(running.url + '/api/models')).status).toBe(200)
+    expect(() => process.kill(pid, 0)).not.toThrow()
   }, 60000)
   it('terminates an orphaned storage owner before booting a new supervisor', async () => {
     const running = await fixture()

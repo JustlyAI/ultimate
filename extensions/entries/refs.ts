@@ -15,14 +15,13 @@ export type AbstractData = {
   anchor?: EntryId
 }
 
-/** A note's data: from another conversation or tally catch-up, or with `source: 'lander'` a landing card's. */
+/** A note's data: from another conversation or a commit catch-up, or with `source: 'lander'` a landing card's. */
 export type NoteData =
   | {
       text: string
       from?: ConversationId
       title?: string
       source?: 'finished' | 'main'
-      tally?: EntryId
     }
   | {
       source: 'lander'
@@ -31,6 +30,7 @@ export type NoteData =
       at?: number
       divergence?: string
       sha: string
+      submission?: string
       base?: string
       target: string
       title?: string
@@ -43,7 +43,7 @@ export type NoteData =
       abstract?: Omit<AbstractData, 'conversation'>
     }
 
-/** A note received from another conversation, the lander, or tally catch-up. Lineage writes it. */
+/** A note received from another conversation, the lander, or a commit catch-up. Lineage writes it. */
 export const NoteEntry = defineEntry<NoteData>('lineage.note')
 
 /**
@@ -92,11 +92,12 @@ export type AutomationInput = {
   id: string
   name: string
   text: string
-  serves?: Serves
   /** Branches whose reply or report the run that created the automation read: its first fire's answer goes to them. */
   branches?: ConversationId[]
-  at?: number
 }
 
 /** Fired trigger delivered to a subscriber. */
 export const FiredEntry = defineEntry<AutomationInput>('automations.fired')
+
+/** A prompt run's answer, or its failure, delivered to a subscriber when the run ends. */
+export const FinishedEntry = defineEntry<AutomationInput>('automations.finished')

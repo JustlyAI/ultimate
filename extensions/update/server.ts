@@ -8,7 +8,7 @@ import { defineExtension, ROOT_CONVERSATION_ID } from '@earendil-works/pi-durabl
 import type { ExtensionHost } from '../../server/extensions.ts'
 import type { EventToken } from '../../shared/events.ts'
 import { implementAction } from '../../lib/actions.ts'
-import { ignoring, isMissing, meansNone, settled } from '../../lib/errors.ts'
+import { rebuiltOnOpen, ignoring, isMissing, meansNone, settled } from '../../lib/errors.ts'
 import { deadline, every, pace } from '../../lib/timers.ts'
 import { compareUrl } from '../../lib/compare.ts'
 import { exec } from '../../lib/exec.ts'
@@ -21,6 +21,7 @@ import { SubmissionLanded, WorkspacesApi } from '../workspaces/api.ts'
 import { PauseApi } from '../pause/api.ts'
 import {
   cloneState,
+  updateMessages,
   fetchIfDue,
   gitPath,
   layersOf,
@@ -221,8 +222,11 @@ export default function update(host: ExtensionHost) {
     [SubmissionLanded],
     async () => {
       const backgroundInstall = loadable(host)
-      backgroundInstall.catch((error: unknown) =>
-        host.notice(`Install after landing: ${String(error)}`),
+      rebuiltOnOpen(
+        'onBeforeLoad installs an owed lockfile again',
+        backgroundInstall.catch((error: unknown) =>
+          host.notice(`Install after landing: ${String(error)}`),
+        ),
       )
     },
     { from: 'now' },
@@ -293,7 +297,7 @@ async function refresh(host: ExtensionHost, fetchAndSummarizeUnderLock: boolean,
     return summaryFor(
       summaryFile,
       `${head}..${remoteHead}`,
-      () => git('log', '--format=%s%n%n%b', `${head}..${remoteHead}`),
+      () => updateMessages(git, `${head}..${remoteHead}`),
       allowModelRequest ? (input) => ask(host, input) : undefined,
     )
   }

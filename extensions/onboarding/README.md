@@ -38,7 +38,7 @@ while @ultimate is idle, its newest run failed that way and nothing since the st
 meanwhile may have failed too), a repeated call continues it instead, checked and admitted in one commit, so two calls
 start one run. Once @ultimate answered anything after the start, onboarding is under way and a call sends nothing.
 
-Start here is a card above @ultimate's composer (`survey.tsx`, through the SDK's `composer` renderer) until
+Start here is a card above @ultimate's composer (`survey.solid.tsx`, through the SDK's `composer` renderer) until
 onboarding has run for the project's root: `onboarding.starts` names the root, or the root carries memories (a new
 chapter's root, set up long ago; `onboarded.ts`). Its one button, **Set up with @ultimate**, calls `start { root }`,
 like Get ready's Continue; once that records the root, the card is gone for good. While @ultimate's model has no
@@ -119,7 +119,7 @@ contributions, secrets, prompt sections and hooks, and its folder. Empty groups 
 ## Actions
 
 This default-on built-in exports browser actions. Settings choices and completion actions are user-only: agents
-cannot apply them through codemode `ultimate.action`.
+cannot apply them through codemode `tools.action`.
 
 - `start { root?, instructions? }`: starts the flow above once per root, returning `{ id }`; user-only.
 - `walkthrough`: has @ultimate run the walkthrough again, without setup, returning `{ id }`; user-only.

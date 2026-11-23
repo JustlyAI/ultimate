@@ -12,6 +12,7 @@ import type { JsonValue } from '@earendil-works/chord/json'
 import type { Op } from '@earendil-works/chord/delta'
 import type { AuthType, ModelThinkingLevel } from '@earendil-works/pi-ai'
 import type { ModelRuntime } from '@earendil-works/pi-coding-agent'
+import type { UiSource } from './events.ts'
 
 export const imageMimeTypes = ['image/png', 'image/jpeg', 'image/webp', 'image/gif']
 export const maxImageBytes = 2 * 1024 * 1024
@@ -190,17 +191,40 @@ export interface ModelsResponse {
     available: boolean
   }[]
 }
+export interface UiOp {
+  key: string
+  value?: JsonValue
+  who?: UiSource['source']
+  seq?: number
+}
 export interface UiUpdateRequest {
-  set?: Record<string, JsonValue>
-  delete?: string[]
+  ops: UiOp[]
+  tab?: string
 }
 export const UI_REVISION = 'ui.rev'
+export const SOURCE_HEADER = 'x-ultimate-source'
 type CommittedUiRevision = number
-export interface UiUpdateResponse {
-  ok: true
-  rev: CommittedUiRevision
-}
+export type UiUpdateResponse = { ok: true; rev: CommittedUiRevision }
 type StreamHandshakeBeforeSubscriptions = { id: string }
+type HttpStatusOfRefusedOpen = number
+export interface ReadSpec {
+  extension: string
+  action: string
+  args: JsonValue
+  conversation?: number
+}
+export type ViewSubscription = { sub: number; conversation?: number; docs: string[]; view: boolean }
+export type ReadSubscription = { sub: number; read: ReadSpec; every?: ReadAgainAfterMs }
+export interface SubscriptionsRequest {
+  subscribe: (ViewSubscription | ReadSubscription)[]
+  unsubscribe: number[]
+}
+type ReadAgainAfterMs = number
+export type ReadEvent = { result: JsonValue } | { error: string; status: number }
+export interface SubscriptionsAnswer {
+  ok: true
+  refused: Record<number, HttpStatusOfRefusedOpen>
+}
 export interface ServerEvents {
   stream: StreamHandshakeBeforeSubscriptions
   system: SystemInfo
@@ -212,5 +236,8 @@ export interface ServerEvents {
   doc: { kind: string; value: Readonly<JsonObject> | null }
   docOps: { kind: string; ops: readonly Op[] }
   tasks: TaskGraph
+  conversationsOps: readonly Op[]
+  tasksOps: readonly Op[]
   notice: Notice
+  read: ReadEvent
 }

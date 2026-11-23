@@ -2,19 +2,16 @@ import { parseConversationId } from '../../../lib/ids.ts'
 import type { ConversationId } from '@earendil-works/pi-durable'
 import { ActionError, actionMessage, createApi } from './api.ts'
 import { createReads } from './reads.ts'
+import { errorMessage } from './format.ts'
 import { deadline } from '../../../lib/timers.ts'
 import { linkedConversation } from './link.ts'
 import { HOME, createRegistry } from './registry.ts'
 import { createStore } from './store.ts'
 import { createTestHook } from './test-hook.ts'
-import type { TestHook } from './test-hook.ts'
-
-declare global {
-  interface Window {
-    ultimate?: TestHook
-  }
-}
-import { createUiState } from './ui-state.ts'
+import { createUiAgent } from './agent.ts'
+import { agentsPage } from './writer.ts'
+import { firstRender } from './resume.ts'
+import { createUiState, tabWrites } from './ui-state.ts'
 
 const initialUrl = new URL(location.href)
 let initialUrlSelectionResolved = false
@@ -43,34 +40,43 @@ export const store = createStore({
     uiState.delete('shell.conversation')
   },
 })
-/** Server commands; conversation commands default to the shown conversation. */
+const driven = sessionStorage.getItem('ultimate.driven') === '1'
+if (driven) agentsPage()
+
 export const api = createApi(store)
 
 export const reads = createReads(api, store)
 
-const automatedOrDetachedTab =
-  navigator.webdriver || sessionStorage.getItem('ultimate.detached') === '1'
+const { shares: followsSharedUiState, ...tabOnly } = tabWrites({
+  driven,
+  detached: sessionStorage.getItem('ultimate.detached') === '1',
+  webdriver: navigator.webdriver,
+})
 
-export const uiState = createUiState(automatedOrDetachedTab ? undefined : api.updateUi, {
+export const uiState = createUiState(followsSharedUiState ? api.updateUi : undefined, {
   onError: (error) =>
     store.notify({
       level: 'error',
       message: `UI state not saved: ${String(error)}`,
     }),
+  ...tabOnly,
 })
 
-if (sessionStorage.getItem('ultimate.driven') === '1') window.ultimate = createTestHook(store, api)
+export const uiAgent = createUiAgent()
 
 export const registry = createRegistry()
 
-/** The web bundle this page runs (`server/web.ts` names it in the page). */
+if (driven)
+  window.ultimate = createTestHook(store, api, uiAgent, uiState, firstRender, (signal) =>
+    reads.settledInUse(signal),
+  )
+
 export const bundle = document.querySelector<HTMLMetaElement>('meta[name=ultimate-web]')?.content
 
 const reloadNoticeMs = 600
 let switching = false
 
 const switchKey = 'ultimate.web-switch'
-/** Set when this page load is a switch to a new bundle: when, and the sources that changed. */
 export const switched = ((): { at: number; changed: string[] } | undefined => {
   const stored = sessionStorage.getItem(switchKey)
   sessionStorage.removeItem(switchKey)
@@ -123,7 +129,7 @@ store.subscribe(() => {
       if (linkedConversation(initialUrl, navigation?.type)) uiState.set('shell.surface', HOME)
       initialUrlSelectionResolved = true
       followSelection()
-    } else if (!automatedOrDetachedTab) uiState.receive(shared)
+    } else if (followsSharedUiState) uiState.receive(shared)
   }
 
   const { view, requested } = store.getState()
@@ -141,6 +147,15 @@ store.subscribe(() => {
     .querySelector('meta[name=theme-color]')
     ?.setAttribute('content', ui.theme === 'dark' ? '#111112' : '#f9fafb')
 })
+
+const compactFailures = new Set<string>()
+
+export function reportCompact(extension: string, error: unknown) {
+  const failure = `extension ${extension}: compact is off, its when() threw: ${errorMessage(error)}`
+  if (compactFailures.has(failure)) return
+  compactFailures.add(failure)
+  queueMicrotask(() => store.notify({ level: 'error', message: failure }))
+}
 
 export function replaceNextSelection() {
   replaceSelection = true
@@ -171,7 +186,7 @@ addEventListener('popstate', () => {
     replaceSelection = false
   }
 })
-addEventListener('pagehide', () => uiState.flush())
+addEventListener('pagehide', () => void uiState.exit())
 
 addEventListener('unhandledrejection', (event) => {
   if (!(event.reason instanceof ActionError)) return

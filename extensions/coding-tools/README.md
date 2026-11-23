@@ -8,7 +8,7 @@ Each commit made through `bash` is also recorded as the durable event `coding-to
 
 The events commit on their own right after the bash call, with its trace context, not in the tool result's commit: Pi settles the result after the wrapper returns. A crash between the git commit and that commit loses its event; the trailer remains. Commits made outside an agent's `bash` (the user in a terminal, extensions' own `git` calls such as the lander's merge commit) are not recorded. Find them with `debug {call: 'events', events: ['coding-tools.committed']}` or the System stream's Events filter.
 
-Pi's coding tools and how the transcript shows them: `read` as a numbered, highlighted excerpt; `write` with its size and content; `edit` as a unified diff with old and new line numbers; `bash` as a terminal with streamed output, exit status, and duration. `bash-command.tsx` parses the command with [unbash](https://github.com/webpro-nl/unbash) (display only): the card stays collapsed once finished (open while running or failed) and its header condenses the command to its programs: pipes as arrows, list operators between steps, repeats folded (`sed ×2 · rg → head`), a heredoc's target file, and a literal leading `cd` as the directory on the right. Expanded, each step gets a highlighted row and every heredoc body is highlighted by its target file or interpreter. Unparsable commands stay raw.
+Pi's coding tools and how the transcript shows them: `read` as a numbered, highlighted excerpt; `write` with its size and content; `edit` as a unified diff with old and new line numbers; `bash` as a terminal with streamed output, exit status, and duration. `bash-command.ts` parses the command with [unbash](https://github.com/webpro-nl/unbash) (display only): the card stays collapsed once finished (open while running or failed) and its header condenses the command to its programs: pipes as arrows, list operators between steps, repeats folded (`sed ×2 · rg → head`), a heredoc's target file, and a literal leading `cd` as the directory on the right. Expanded, each step gets a highlighted row and every heredoc body is highlighted by its target file or interpreter. Unparsable commands stay raw.
 
 Bash calls without `timeout` have a 600-second tripwire ceiling. `ULTIMATE_BASH_TIMEOUT` overrides that default
 in seconds and is read at each call; it must be positive and finite. A tripwire timeout stops the process and reports
@@ -21,6 +21,17 @@ tail truncation keeps it) as an ordinary result, so the run goes on and the stee
 instead of after the wait. Follow-ups never interrupt. A marked command that changes things (`git push|commit|merge`,
 an `install` or `migrate` word) is refused with a hint to split it, so a steer can never cut it mid-way.
 
+A bash call with `background: true` (dev servers, watchers) starts the command in its own process group through
+`spawnGroup` (`lib/process-group.ts`) and returns at once with the group id, a log of its output and `kill -- -<pgid>`.
+The pid file and log live in `<home>/background/<conversation>/`, named after the Ultimate process that started them.
+After spawning, the call commits a check that the conversation and its owners are not concluded, together with the
+event `coding-tools.background-started`; a concluded conversation or a failed commit stops the new group at once.
+Concluding emits `conversations.concluded` with the conversation and every conversation it owns. The
+`stop-background` reactor reads both events in log order: it records started groups in the root's
+`coding-tools.background` document, and on a conclusion takes exactly the groups started before it into a durable
+effect that stops them and removes their files, so a resumed conversation keeps what it started since. Each open stops the groups an earlier process recorded, so a restart ends every background process; the agent starts it
+again. A pid is signalled only while its pid file still names it with the start time it recorded.
+
 Any running bash call can be cancelled from its card (the × next to its timer): the user-only action
 `cancel {callId}` (`refs.ts`) records the call in the conversation's durable `coding-tools.cancelled` document, which
 every bash call watches like the inbox above, so a cancel reaches a call started before an extension reload. The call
@@ -32,4 +43,8 @@ calls no longer running, and a cancel of a call that is not running fails.
 Pi's `prepare` hook only changes the command, cwd, and environment, not the timeout, so one wrapper injects the
 default and formats execution timeout errors.
 
-`server.ts` installs Pi Durable's read, write, edit, and bash tools (named `coding-tools`, like this folder). `web.tsx` registers one renderer per tool name under `tools`; `diff.tsx` turns the edit tool's `details.patch` (or Pi's display `details.diff`) into rows.
+Foreground and background commands start with `unset NODE_ENV`. The host's Vite server sets `NODE_ENV=development`
+whenever it is unset, and every shell would inherit it: a project's tests would then run in development mode, unlike
+in the user's own terminal or CI.
+
+`server.ts` installs Pi Durable's read, write, edit, and bash tools (named `coding-tools`, like this folder). `web.solid.tsx` registers one renderer per tool name under `tools`; `diff.ts` turns the edit tool's `details.patch` (or Pi's display `details.diff`) into rows.

@@ -7,6 +7,7 @@ import type {
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdirSync, mkdtempSync } from 'node:fs'
 import { mkdir, readdir, realpath, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { stripVTControlCharacters } from 'node:util'
 import { copyJson } from '@earendil-works/chord/json'
@@ -17,6 +18,7 @@ import { debounce, deadline } from '../../lib/timers.ts'
 import { git } from '../../lib/git.ts'
 import { overshadowed, retriedLater, settled } from '../../lib/errors.ts'
 import { needsRestart as restartNeeded } from '../../lib/layers.ts'
+import { formatDuration } from '../../lib/format.ts'
 import { runGroup, sweepPidFiles } from '../../lib/process-group.ts'
 import { landingWeight } from '../../lib/token-weight.ts'
 import type { ExtensionHost } from '../../server/extensions.ts'
@@ -96,6 +98,21 @@ export const log = (
     },
   })
 }
+const starterLine = (
+  branch: ConversationId,
+  sha: string,
+  outcome: WorkspaceIndex['results'][string],
+) =>
+  [
+    `#${branch}${outcome.subject?.title ? ` ${outcome.subject.title}` : ''} ${outcome.commits?.length ? `landed as ${sha.slice(0, 7)} on ${outcome.target}` : `had nothing new to land on ${outcome.target}`}`,
+    ...(outcome.pushed ? [`pushed`] : []),
+    ...(outcome.reason ? [outcome.reason] : []),
+    ...(outcome.needsRestart ? ['needs restart'] : []),
+    ...(outcome.flaky?.length ? [`flaky: ${outcome.flaky.join(', ')}`] : []),
+  ]
+    .join(' · ')
+    .replace(/\s*\n\s*/g, ' ')
+
 type Host = Pick<
   ExtensionHost,
   'home' | 'ultimateRoot' | 'harness' | 'projectSettings' | 'doc' | 'metadata' | 'notice' | 'emit'
@@ -115,7 +132,6 @@ export const limitsFor = (check: Check, limits: CheckLimits): CheckLimits =>
     ? limits
     : { stall: Math.min(limits.stall, check.timeout), total: check.timeout }
 const vitestFailureLine = /^\s*(FAIL|×|✗)\s/
-const seconds = (value: number) => (value < 60 ? `${value} s` : `${+(value / 60).toFixed(1)} min`)
 
 export const checkPids = (home: string) => join(home, 'lander-checks')
 export const sweepChecks = async (home: string) => {
@@ -129,7 +145,7 @@ export const sweepChecks = async (home: string) => {
     if (!name.startsWith(`${process.pid}-`))
       await rm(join(checkTemp(home), name), { recursive: true, force: true })
 }
-export const checkTemp = (home: string) => join(home, 'lander-tmp')
+export const checkTemp = (home: string) => join(tmpdir(), `ultimate-lander-${landerHash(home)}`)
 
 export async function runLanderCheck(
   path: string,
@@ -138,7 +154,8 @@ export async function runLanderCheck(
   pids: string,
   temp: string,
   limits: CheckLimits = defaultCheckLimitsSeconds,
-) {
+  base?: string,
+): Promise<CheckRun> {
   const tmp = createTempBeforeWatchdog(temp)
   let output = ''
   let partial = ''
@@ -154,15 +171,22 @@ export async function runLanderCheck(
     stopped = reason
     watchdog.abort()
   }
-  const stalled = () => stop(`Stalled: no output for ${seconds(limits.stall)}, stopped`)
+  const stalled = () =>
+    stop(`Stalled: no output for ${formatDuration(limits.stall * 1000)}, stopped`)
   const stallDeadline = debounce(limits.stall * 1000, stalled)
   stallDeadline()
   const cancelTotal = deadline(limits.total * 1000, () =>
-    stop(`Timed out after ${seconds(limits.total)}`),
+    stop(`Timed out after ${formatDuration(limits.total * 1000)}`),
   )
   const report = (reason: string, heading: string) => {
     const tests = [...failed].slice(-20)
-    return [reason, ...(tests.length ? [heading, ...tests] : []), output].join('\n').trim()
+    const failedFiles = [...failed]
+      .filter((test) => test.startsWith('FAIL'))
+      .map((test) => test.slice('FAIL'.length).replace(/\s+/g, ' ').trim())
+    return {
+      failure: [reason, ...(tests.length ? [heading, ...tests] : []), output].join('\n').trim(),
+      cause: [reason, ...failedFiles.slice(0, 5)].join(': '),
+    }
   }
   const onOutput = (text: string) => {
     output = (output + text).slice(-3000)
@@ -175,11 +199,11 @@ export async function runLanderCheck(
     stallDeadline()
   }
   try {
-    let exitCode: number
+    let exit: Awaited<ReturnType<typeof runGroup>>
     try {
-      exitCode = await runGroup('/bin/bash', ['-c', command], {
+      exit = await runGroup('/bin/bash', ['-c', command], {
         cwd: path,
-        env: { ...process.env, TMPDIR: tmp },
+        env: { ...process.env, TMPDIR: tmp, ...(base && { ULTIMATE_LANDER_BASE: base }) },
         pidFile: join(pids, `${process.pid}-${randomUUID()}.pid`),
         signal,
         grace: 2000,
@@ -187,11 +211,12 @@ export async function runLanderCheck(
       })
     } catch (error) {
       context.abortSignal?.throwIfAborted()
-      return { failure: `${output}\n${String(error)}`.trim() }
+      return { failure: `${output}\n${String(error)}`.trim(), cause: String(error) }
     }
     context.abortSignal?.throwIfAborted()
-    if (stopped) return { failure: report(stopped, 'Failed tests so far:'), timedOut: true }
-    if (exitCode !== 0) return { failure: report(`exit ${exitCode}`, 'Failed tests:') }
+    if (stopped) return { ...report(stopped, 'Failed tests so far:'), timedOut: true }
+    if (exit.outOfMemory) return report(`Out of memory: exit ${exit.code}`, 'Failed tests so far:')
+    if (exit.code !== 0) return report(`exit ${exit.code}`, 'Failed tests:')
     const last = lines(stripVTControlCharacters(output)).findLast((line) => line.trim())
     return { summary: last?.trim().slice(0, 200) }
   } finally {
@@ -202,6 +227,10 @@ export async function runLanderCheck(
     )
   }
 }
+
+type CheckRun =
+  | { failure?: undefined; summary?: string; timedOut?: undefined }
+  | { failure: string; cause: string; summary?: undefined; timedOut?: boolean }
 
 function createTempBeforeWatchdog(temp: string) {
   mkdirSync(temp, { recursive: true })
@@ -276,7 +305,7 @@ type CommittedDeliveryDecision = {
   phase: 'deliver'
   id: string
   conversationId: ConversationId
-  text: string
+  headline: string
   outcome: WorkspaceIndex['results'][string]
   concluded: boolean
   starter?: ConversationId
@@ -289,6 +318,7 @@ type UnderwayReportPhase = {
   id: string
   conversationId: BranchReportHeldAsNote
   text: string
+  headline: string
   outcome: WorkspaceIndex['results'][string]
 }
 
@@ -297,7 +327,29 @@ type State =
   | { phase: 'land'; id: string; attempt: number; pushRetried?: boolean }
   | UnderwayReportPhase
   | CommittedDeliveryDecision
+  | { phase: 'card-failed'; error: string }
   | ConcludedBranchRelease
+
+export async function hasPendingLanderReport(tx: Tx, index: WorkspaceIndex, id: ConversationId) {
+  for (const taskId of Object.values(index.landers)) {
+    const state = (await tx.task(taskId))?.state
+    if (!state || state.status === 'terminal') continue
+    const checkpoint = state.checkpoint as State | undefined
+    if (checkpoint?.phase === 'report' && checkpoint.conversationId === id) return true
+  }
+  return false
+}
+
+export async function activeLandingCards(tx: Tx, index: WorkspaceIndex) {
+  const results: string[] = []
+  for (const taskId of Object.values(index.landers)) {
+    const task = await tx.task(taskId)
+    const checkpoint = task?.state.checkpoint as State | undefined
+    if (checkpoint?.phase === 'deliver' && checkpoint.concluded && checkpoint.starter !== undefined)
+      results.push(checkpoint.id)
+  }
+  return results
+}
 
 export function createLander(
   host: Host,
@@ -307,6 +359,9 @@ export function createLander(
     starter: (id: ConversationId, context: Context) => Promise<ConversationId | undefined>
     working: (tx: Tx, id: ConversationId) => Promise<boolean>
     conclude: (tx: Tx, id: ConversationId) => Promise<void>
+    reserveLanding: import('./api.ts').BranchesService['reserveLanding']
+    retireLanding: import('./api.ts').BranchesService['retireLanding']
+    submitLanding: import('./api.ts').BranchesService['submitLanding']
     release: (id: ConversationId, context: Context) => Promise<unknown>
   },
   limits: CheckLimits = defaultCheckLimitsSeconds,
@@ -378,7 +433,7 @@ export function createLander(
                 ms: Math.round(ran.ms),
               })
           }, context)
-        const commitLandingOutcome = (text: string, outcome: LanderOutcome) =>
+        const commitLandingOutcome = (text: string, outcome: LanderOutcome, sha = outcome.sha) =>
           runtime.commit(async (tx) => {
             const draft = await tx.doc(Workspaces, ROOT_CONVERSATION_ID)
             const steps = draft.queue.find((item) => item.id === id)!.steps
@@ -437,6 +492,7 @@ export function createLander(
                 id,
                 conversationId: entry.conversationId,
                 outcome: draft.results[id],
+                headline: starterLine(entry.conversationId, sha ?? '', draft.results[id]),
                 text: `[lander] Submission ${id} (#${entry.conversationId}, ${entry.tip.slice(0, 7)}) ${text}\nLog: lander conversation #${runtime.conversationId}.`,
               },
             }
@@ -524,6 +580,7 @@ export function createLander(
               ...(pushed.remote ? { pushed: pushed.remote } : {}),
               ...(needsRestart ? { needsRestart } : {}),
             },
+            sha,
           )
         }
         try {
@@ -580,7 +637,7 @@ export function createLander(
                       await mergeOrReportConflict(
                         fetched,
                         `Merge ${settings.push}/${target}`,
-                        `${settings.push}/${target} conflicts with local ${target} in`,
+                        `${settings.push}/${target} conflicts with local ${target}`,
                         `Reconcile ${settings.push}/${target} with local ${target}, then submit again.`,
                       )
                     )
@@ -619,17 +676,19 @@ export function createLander(
                   checkPids(host.home),
                   checkTemp(host.home),
                   limitsFor(members[member], limits),
+                  base,
                 )
               const runCheckWithOneDurableRerun = async (command: string, member: number) => {
                 const attemptMemoKey = `check:${id}:${attempt}:${Array.isArray(group) ? `${position}.${member}` : position}`
-                let memoizedFirstRun = await runtime.memo<'passed' | 'failed'>(
-                  attemptMemoKey,
-                  context,
-                )
+                const causeMemoKey = `${attemptMemoKey}:cause`
+                let memoizedFirstRun =
+                  (await runtime.memo<'passed' | 'failed'>(attemptMemoKey, context)) ??
+                  ((await runtime.memo<string>(causeMemoKey, context)) ? 'failed' : undefined)
                 if (!memoizedFirstRun) {
                   await step(`checking: ${command}`, { runs: command })
                   const began = performance.now()
                   const ran = await run(command, member)
+                  const ms = performance.now() - began
                   const unmemoizedResult = ran.failure === undefined ? 'passed' : 'failed'
                   const logAttemptBeforeMemo = step
                   await logAttemptBeforeMemo(`checked: ${command}`, {
@@ -639,8 +698,10 @@ export function createLander(
                       ...(ran.summary ? { summary: ran.summary } : {}),
                     },
                     output: ran.failure,
-                    ran: { ms: performance.now() - began, timedOut: ran.timedOut },
+                    ran: { ms, timedOut: ran.timedOut },
                   })
+                  if (ran.failure !== undefined)
+                    await runtime.memo(causeMemoKey, ran.cause, context)
                   memoizedFirstRun = await runtime.memo(attemptMemoKey, unmemoizedResult, context)
                 }
                 if (memoizedFirstRun === 'passed') return {}
@@ -677,7 +738,9 @@ export function createLander(
                     context,
                   )
                 }
-                return rerun.failure === undefined ? { flaky: true } : { failure: rerun.failure }
+                if (rerun.failure !== undefined) return { failure: rerun.failure }
+                const cause = await runtime.memo<string>(causeMemoKey, context)
+                return { flaky: cause ? `${command} · ${cause}` : command }
               }
               const settledCheckGroup = await Promise.allSettled(
                 commands.map(runCheckWithOneDurableRerun),
@@ -693,7 +756,7 @@ export function createLander(
                   results[failed].failure,
                   'Fix it at its cause (a flaky test too: fix or delete it), verify and submit again.',
                 )
-              flaky.push(...commands.filter((_command, member) => results[member].flaky))
+              flaky.push(...results.flatMap((result) => result.flaky ?? []))
             }
             const checkedTreeChanged =
               (await git(path, 'rev-parse', 'HEAD')) !== mergedBeforeChecks.sha ||
@@ -767,7 +830,7 @@ export function createLander(
         }
       },
       report: async (task, runtime, context) => {
-        const { id, conversationId, text, outcome } = task.state.checkpoint
+        const { id, conversationId, text, headline, outcome } = task.state.checkpoint
         const branch = conversationId
         const entry = { kind: LanderReportEntry.kind, data: { id, outcome } }
         const next = { status: 'running', checkpoint: { phase: 'next' } } as const
@@ -807,13 +870,15 @@ export function createLander(
             } catch (error) {
               host.notice(`Not concluding #${branch} after landing: ${String(error)}`)
             }
+          if (concludedInThisCommit && starter !== undefined && starter !== branch)
+            await after.reserveLanding(tx, branch, id)
           return {
             status: 'running',
             checkpoint: {
               phase: 'deliver',
               id,
               conversationId,
-              text,
+              headline,
               outcome,
               concluded: concludedInThisCommit,
               ...(starter !== undefined && starter !== branch ? { starter } : {}),
@@ -825,38 +890,55 @@ export function createLander(
         const {
           id,
           conversationId,
-          text,
+          headline,
           outcome,
           concluded: conclusionCommitted,
           starter,
         } = task.state.checkpoint
         const entry = { kind: LanderReportEntry.kind, data: { id, outcome } }
-        const content = `${text}\nDiverged: ${outcome.divergence}\n${conclusionCommitted ? `#${conversationId} is concluded.` : `#${conversationId} still has work under way; it reports when it stops.`}`
-        if (starter !== undefined)
-          await (
-            await host.harness().conversation(starter, context)
-          )?.submit(
-            conclusionCommitted
-              ? { type: 'input', content, entry, whenBusy: 'followUp', requestId: `lander:${id}` }
-              : {
-                  type: 'write',
-                  requestId: `lander:${id}`,
-                  entry: {
-                    ...entry,
-                    model: [{ role: 'user', content, timestamp: Date.now() }],
-                  },
-                },
-            context,
-          )
-        await runtime.commit(
-          () => ({
-            status: 'running',
-            checkpoint: conclusionCommitted
-              ? { phase: 'release', conversationId }
-              : { phase: 'next' },
-          }),
-          context,
-        )
+        const content = `${headline}\nDiverged: ${outcome.divergence}\n${conclusionCommitted ? `#${conversationId} is concluded.` : `#${conversationId} still has work under way; it reports when it stops.`}`
+        try {
+          const to =
+            starter === undefined ? undefined : await runtime.conversation(starter, context)
+          await runtime.commit(async (tx) => {
+            if (to && conclusionCommitted)
+              await after.submitLanding(
+                tx,
+                to,
+                { type: 'input', content, entry, whenBusy: 'followUp', requestId: `lander:${id}` },
+                conversationId,
+                id,
+              )
+            else if (to)
+              await to.submit(tx, {
+                type: 'write',
+                requestId: `lander:${id}`,
+                entry: { ...entry, model: [{ role: 'user', content, timestamp: Date.now() }] },
+              })
+            else if (conclusionCommitted && starter !== undefined) await after.retireLanding(tx, id)
+            return {
+              status: 'running',
+              checkpoint: conclusionCommitted
+                ? { phase: 'release', conversationId }
+                : { phase: 'next' },
+            }
+          }, context)
+        } catch (error) {
+          if (runtime.signal.aborted || !conclusionCommitted || starter === undefined) throw error
+          await runtime.commit(async (tx) => {
+            await after.retireLanding(tx, id)
+            return {
+              status: 'running',
+              checkpoint: {
+                phase: 'card-failed',
+                error: error instanceof Error ? error.message : String(error),
+              },
+            }
+          }, context)
+        }
+      },
+      'card-failed': (task) => {
+        throw new Error(task.state.checkpoint.error)
       },
       release: async (task, runtime, context) => {
         await after
@@ -879,6 +961,13 @@ export function createLander(
             item.state = 'queued'
             delete item.step
           }
+        const checkpoint = task.state.checkpoint
+        if (
+          checkpoint.phase === 'deliver' &&
+          checkpoint.concluded &&
+          checkpoint.starter !== undefined
+        )
+          await after.retireLanding(tx, checkpoint.id)
         return { status: 'terminal', outcome: { status: 'aborted' } }
       }, context),
   })

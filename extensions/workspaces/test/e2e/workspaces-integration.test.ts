@@ -33,22 +33,24 @@ import {
   concludeIn,
   subject,
 } from '../../../conversations/server.ts'
+import { concludedIn } from '../../../conversations/projection.ts'
 import { ConversationsApi } from '../../../conversations/api.ts'
 import type { ConversationsService } from '../../../conversations/api.ts'
 import { setAutomaticSummaries, Summaries } from '../../../conversations/summary.ts'
 import { setStanding } from '../../../conversations/server.ts'
+import { SubmitAfter, submitAfter } from '../../../conversations/submit.ts'
 import self from '../../../self/server.ts'
 import messagesExtension from '../../../messages/server.ts'
 import { Messages, MessagesApi } from '../../../messages/api.ts'
-import { Started } from '../../../messages/addresses.ts'
+import { Serving, Started } from '../../../messages/addresses.ts'
 import promptExtension, { order as promptOrder } from '../../../prompt/server.ts'
 import subagents from '../../../subagents/server.ts'
-import { Subagents } from '../../../subagents/api.ts'
-import { seedTally, temp, until } from '../../../../test/helpers.ts'
+import { Standing, Subagents } from '../../../subagents/api.ts'
+import { openers, seedTally, temp, until } from '../../../../test/helpers.ts'
 
 /** The part of the conversations service a test stands in for; standing a lander turns its summaries off and marks it standing. */
 const conversations = (service: Partial<ConversationsService>) =>
-  ({ setAutomaticSummaries, setStanding, ...service }) as ConversationsService
+  ({ setAutomaticSummaries, setStanding, submitAfter, ...service }) as ConversationsService
 
 // Every test has its own repository and harness, so they all run concurrently; fixtures close when the file ends.
 vi.setConfig({ maxConcurrency: 16 })
@@ -97,8 +99,14 @@ async function fixture(
   const restart = vi.fn<ExtensionHost['restart']>(async () => 'RESTART_CALLED')
   const notice = vi.fn<ExtensionHost['notice']>()
   // As the server: openers run each time the harness opens, cleanups each time it closes.
-  const openers: (() => Promise<void>)[] = []
+  const lifecycle = openers()
   const closers: (() => Promise<void>)[] = []
+  const lateStops: (() => Promise<void>)[] = []
+  const closeAll = async () => {
+    for (const stop of lateStops.splice(0)) await stop()
+    await lifecycle.close()
+    for (const close of closers) await close()
+  }
   const lookup = ({ name }: { name: string }) => services.get(name)
   // As the server: the real event log, and reactors that run while the harness is open.
   const events = eventLog(
@@ -114,10 +122,15 @@ async function fixture(
     eventLog: events.eventLog,
     react: (...[name, tokens, handler]: Parameters<typeof events.reactor>) => {
       const reactor = events.reactor(name, tokens, handler)
-      openers.push(reactor.start)
-      closers.push(reactor.stop)
-      // oxlint-disable-next-line typescript/no-floating-promises -- reactor start waits for its drain chain, which records handler failures rather than rejecting.
-      if (started) void reactor.start()
+      lifecycle.onOpen(async (thisOpen) => {
+        thisOpen.defer(reactor.stop)
+        await reactor.start()
+      })
+      if (started) {
+        lateStops.push(reactor.stop)
+        // oxlint-disable-next-line typescript/no-floating-promises -- reactor start waits for its drain chain, which records handler failures rather than rejecting.
+        void reactor.start()
+      }
     },
     implement: (api: { name: string }, value: unknown) => {
       services.set(api.name, value)
@@ -133,7 +146,7 @@ async function fixture(
     },
     restart,
     notice,
-    onOpen: (callback: () => Promise<void>) => openers.push(callback),
+    onOpen: lifecycle.onOpen,
     onClose: (close: () => Promise<void>) => closers.push(close),
     doc: () => undefined,
     conversations: () => [],
@@ -153,6 +166,7 @@ async function fixture(
   const service = workspaces(host)
   if (messagesEnabled) prepared.registry.install(messagesExtension(host))
   prepared.registry.install(workspaceExtension(host))
+  prepared.registry.install(defineExtension({ name: 'conversations', tasks: [SubmitAfter] }))
   prepared.registry.install(self(host))
   prepared.registry.install(subagents(host))
   prepared.registry.install(CodingTools)
@@ -208,10 +222,10 @@ async function fixture(
   }
   prepared.faux!.setResponses([route])
   opened = await prepared.open()
-  for (const open of openers) await open()
+  await lifecycle.open()
   started = true
   cleanup.push(async () => {
-    for (const close of closers) await close()
+    await closeAll()
     await opened.close()
   })
   const create = async () => {
@@ -251,10 +265,10 @@ async function fixture(
     },
     asked,
     reopen: async () => {
-      for (const close of closers) await close()
+      await closeAll()
       await opened.close()
       opened = await prepared.open()
-      for (const open of openers) await open()
+      await lifecycle.open()
     },
   }
 }
@@ -779,6 +793,11 @@ it.concurrent('emits one landed event and notes the root once, across a replayed
     starter: async () => undefined,
     working: async () => false,
     conclude: async () => {},
+    reserveLanding: async () => {},
+    retireLanding: async () => {},
+    submitLanding: async (tx, to, input) => {
+      await to.submit(tx, input)
+    },
     release: async () => [],
   })
   const report = task.definition.phases.report
@@ -1043,7 +1062,8 @@ async function concluding() {
     conversations({
       concluded: async () => new Set<ConversationId>(),
       subject: async () => ({}),
-      concludeIn: (tx, ids) => concludeIn(f.host, tx, ids),
+      concludeIn: (tx, ids, by) => concludeIn(f.host, tx, ids, by),
+      concludedIn,
     }),
   )
   f.prepared.registry.install(lineage(f.host))
@@ -1058,6 +1078,24 @@ async function concluding() {
 
 it.concurrent('notes a clean landing without a branch run, concludes and releases it, and wakes its starter once across replay', async () => {
   const { f, id } = await concluding()
+  const asker = await f.opened.harness.createConversation(
+    { ownership: { kind: 'ownerless' } },
+    context,
+  )
+  const request = await f.opened.harness.commit(async (tx) => {
+    ;(await tx.doc(Standing, ROOT_CONVERSATION_ID)).ultimate = ROOT_CONVERSATION_ID
+    const log = await tx.doc(Messages, ROOT_CONVERSATION_ID)
+    const { owners } = await tx.doc(Serving, ROOT_CONVERSATION_ID)
+    const message = log.next++
+    const assignedBy = (await tx.appendEntry(ROOT_CONVERSATION_ID, { kind: 'test.request' })).id
+    owners[message] = {
+      request: { message, from: asker.id },
+      owner: { kind: 'branch', id },
+      assignedBy,
+      pending: [],
+    }
+    return message
+  }, context)
   const workspace = (await f.service.get(id, context))!
   const task = f.service.Lander
   const report = task.definition.phases.report
@@ -1115,7 +1153,11 @@ it.concurrent('notes a clean landing without a branch run, concludes and release
       context,
     )
     expect(requests.branch).toMatchObject({ type: 'write' })
-    expect(requests.starter).toMatchObject({ type: 'input' })
+    expect(requests.starter).toMatchObject({
+      type: 'input',
+      status: 'done',
+      answer: expect.any(Number),
+    })
     const branch = (await f.opened.harness.conversation(id, context))!
     const entries = (await branch.context(context)).entries
     expect(entries.filter((entry) => entry.kind === 'pi.assistant')).toHaveLength(0)
@@ -1124,11 +1166,26 @@ it.concurrent('notes a clean landing without a branch run, concludes and release
       (entry) => entry.kind === 'workspaces.lander-report',
     )
     expect(reports).toHaveLength(1)
-    expect(JSON.stringify(reports[0].model)).toContain(`#${id} is concluded.`)
+    const sha = (reports[0].data as { outcome: { sha: string } }).outcome.sha.slice(0, 7)
+    expect(reports[0].model?.[0]?.content).toMatch(
+      new RegExp(`^#${id} .*landed as ${sha} on main\nDiverged: None\n#${id} is concluded[.]$`),
+    )
+    expect(
+      JSON.stringify(entries.find((e) => e.kind === 'workspaces.lander-report')!.model),
+    ).toContain('Commits:')
   }
   await checkReports()
+  const results = async () =>
+    (await messageLog(f)).filter((m) => m.to === asker.id && m.re === request)
+  await until(async () => (await results()).length === 1)
+  expect(await results()).toEqual([
+    expect.objectContaining({
+      text: expect.stringContaining(`Result of #${id}, which worked on your message ${request}`),
+    }),
+  ])
   await f.reopen()
   await checkReports()
+  expect(await results()).toHaveLength(1)
 })
 it.concurrent('keeps a landed branch and its checkout while a reply is under way and tells its starter', async () => {
   const { f, id } = await concluding()
@@ -1278,7 +1335,7 @@ it.concurrent('lands two submissions in order onto a moved target and reports bo
   expect(metadata).toEqual({ title: '@lander', label: 'lander' })
   // The lander the submission created is standing at once: concluding it is refused.
   await expect(
-    f.opened.harness.commit((tx) => concludeIn(f.host, tx, [id]), context),
+    f.opened.harness.commit((tx) => concludeIn(f.host, tx, [id], 'user'), context),
   ).rejects.toThrow(`#${id} is a standing agent`)
   expect(cwd).toMatch(/\/lander\/[0-9a-f]{12}$/)
   expect(kinds.every((kind) => kind === 'ultimate.lander')).toBe(true)
@@ -1406,7 +1463,7 @@ it.concurrent('reruns only the failing command of a group, reports its output tw
   await f.service.submit(id, 'None', context)
   const reports = await submitted(f, id)
   expect(reports.at(-1)).toContain('landed as')
-  expect(reports.at(-1)).toContain('Flaky: if [')
+  expect(reports.at(-1)).toMatch(/Flaky: if \[.* · exit 1\\n/)
   const flaky = (await landerLog(f)).log
   expect(flaky.findLast((line) => line.check)!.check).toMatchObject({
     result: 'flaky',
@@ -1418,7 +1475,7 @@ it.concurrent('reruns only the failing command of a group, reports its output tw
   })
   expect(flaky.at(-1)).toMatchObject({
     outcome: 'landed',
-    flaky: [expect.stringContaining('if [')],
+    flaky: [expect.stringMatching(/^if \[.* · exit 1$/)],
   })
   // Every run is one event, reruns included: the failing submission's, then the flaky one's.
   const checks = await f.host.eventLog.recent({ events: [CheckRan], limit: 20 })
@@ -1639,7 +1696,7 @@ it.concurrent('reports a local landing whose push retry conflicts as landed loca
   const [report] = await submitted(f, id)
   const landed = await git(f.projectRoot, 'rev-parse', 'main')
   expect(report).toContain(`landed locally as ${landed.slice(0, 7)} on main.`)
-  expect(report).toContain('Push failed: origin/main conflicts with local main in:')
+  expect(report).toContain('Push failed: origin/main conflicts with local main:')
   expect(report).not.toContain('was not landed')
   expect(
     await git(f.projectRoot, 'merge-base', '--is-ancestor', tip, landed).then(() => true),
@@ -1675,7 +1732,7 @@ it.concurrent('resumes checks after a restart without rerunning passed ones and 
   const [report] = await submitted(f, id)
   expect(await runs()).toBe('first\nsecond\nsecond\nsecond\n')
   expect(report).toContain('landed as')
-  expect(report).toContain(`Flaky: echo second`)
+  expect(report).toMatch(/Flaky: echo second.* · exit 1\\n/)
   expect(await git(f.projectRoot, 'rev-parse', 'main')).toBe(merged)
 })
 it.concurrent('starts a lander for queued submissions left by a lander task that ended', async () => {
@@ -2059,6 +2116,30 @@ it.concurrent('release handles failed checkouts but never removes detached unlan
     JSON.stringify(await f.call(detached, 'bash', { command: 'git rev-parse HEAD' })),
   ).toContain(tip)
   expect(await git(workspace.path, 'rev-parse', 'HEAD')).toBe(tip)
+})
+
+it.concurrent('release keeps a checkout whose commits git cannot read, naming the object', async () => {
+  const f = await fixture()
+  const id = await f.create()
+  await f.service.ready(id, context)
+  const workspace = (await f.service.get(id, context))!
+  await git(workspace.path, 'checkout', '--detach')
+  const lost = await commit(workspace.path, 'lost.txt')
+  await commit(workspace.path, 'tip.txt')
+  const objects = await git(
+    workspace.path,
+    'rev-parse',
+    '--path-format=absolute',
+    '--git-path',
+    'objects',
+  )
+  await unlink(join(objects, lost.slice(0, 2), lost.slice(2)))
+  await expect(f.service.pending([id], context)).rejects.toThrow(`Could not read ${lost}`)
+  expect(await f.service.release([id], context)).toEqual([
+    { id, uncommitted: 0, unlanded: 0, reason: expect.stringContaining(`Could not read ${lost}`) },
+  ])
+  expect((await f.service.get(id, context))!.state).toBe('ready')
+  expect(await readFile(join(workspace.path, 'tip.txt'), 'utf8')).toBe('tip.txt')
 })
 
 it.concurrent('aborting release finishes the current checkout and leaves the remaining batch untouched', async () => {
@@ -2463,9 +2544,16 @@ it.concurrent('release never removes a registered checkout whose .git file is br
   const workspace = (await f.service.get(id, context))!
   await writeFile(join(workspace.path, 'precious.txt'), 'keep me')
   await writeFile(join(workspace.path, '.git'), 'gitdir: /nowhere\n')
-  await expect(f.service.release([id], context)).rejects.toThrow(
-    /not a git repository|gitfile does not point to a valid repository/,
-  )
+  expect(await f.service.release([id], context)).toEqual([
+    {
+      id,
+      uncommitted: 0,
+      unlanded: 0,
+      reason: expect.stringMatching(
+        /not a git repository|gitfile does not point to a valid repository/,
+      ),
+    },
+  ])
   expect((await f.service.get(id, context))!).toMatchObject({
     state: 'ready',
     path: workspace.path,

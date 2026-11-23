@@ -7,6 +7,7 @@ import {
   McpAbortError,
   McpClient,
   McpError,
+  McpHttpError,
   McpTimeoutError,
   StdioTransport,
   StreamableHttpTransport,
@@ -21,13 +22,14 @@ import type { ExtensionAction } from '../../server/actions.ts'
 import type { ExtensionHost } from '../../server/extensions.ts'
 import { ReconnectAction, StatusAction } from './refs.ts'
 import type { McpServerStatus } from './refs.ts'
-import { inBackground } from '../../lib/errors.ts'
+import { rebuiltOnOpen } from '../../lib/errors.ts'
 
 export const reloadOnSettings = true
 export const pollActions = ['status']
 
 const PROGRESS_RENEWED_CALL_TIMEOUT_MS = 10 * 60_000
 const FIRST_RETRY = 5_000
+const rateLimited = (error: unknown) => error instanceof McpHttpError && error.status === 429
 const LAST_RETRY = 5 * 60_000
 
 type Entry =
@@ -162,6 +164,7 @@ const listing = (server: Server) =>
         `\n${tool.name}: ${tool.description?.trim() ?? tool.title ?? ''}\n  input: ${JSON.stringify(tool.inputSchema)}`,
     ),
   ].join('\n')
+const schemaOf = (tool: Tool) => `${tool.name} input: ${JSON.stringify(tool.inputSchema)}`
 const renewTimeoutOnProgress = () => {}
 const failure = (text: string) => ({ output: [{ type: 'text' as const, text }], isError: true })
 
@@ -191,7 +194,11 @@ export default async function mcp(host: ExtensionHost) {
     server.error = error
     const delay = Math.min(FIRST_RETRY * 2 ** server.attempts++, LAST_RETRY)
     server.retryAt = Date.now() + delay
-    server.cancelRetry = retryAfter(delay, () => inBackground(begin(server)), { unref: true })
+    server.cancelRetry = retryAfter(
+      delay,
+      () => rebuiltOnOpen('open reconnects every configured MCP server', begin(server)),
+      { unref: true },
+    )
   }
 
   async function connect(server: Server) {
@@ -232,14 +239,17 @@ export default async function mcp(host: ExtensionHost) {
             }))
       await client.connect(transport)
       client.onNotification('notifications/tools/list_changed', () => {
-        client
-          .listTools()
-          .then((tools) => {
-            if (server.client === client) server.tools = tools
-          })
-          .catch((error: unknown) =>
-            console.warn(`MCP ${server.name}: tools/list: ${redact(server, error)}`),
-          )
+        rebuiltOnOpen(
+          'open reconnects MCP servers and lists their tools again',
+          client
+            .listTools()
+            .then((tools) => {
+              if (server.client === client) server.tools = tools
+            })
+            .catch((error: unknown) =>
+              console.warn(`MCP ${server.name}: tools/list: ${redact(server, error)}`),
+            ),
+        )
       })
       const tools = await client.listTools()
       if (closed || server.client !== client) return
@@ -269,7 +279,8 @@ export default async function mcp(host: ExtensionHost) {
   function queueSingleConnection(server: Server, work: () => Promise<void>) {
     const next = (server.connectionQueueTail ?? Promise.resolve()).then(work)
     server.connectionQueueTail = next
-    inBackground(
+    rebuiltOnOpen(
+      'open reconnects every configured MCP server with a fresh connection queue',
       next.finally(() => {
         if (server.connectionQueueTail === next) delete server.connectionQueueTail
       }),
@@ -316,7 +327,8 @@ export default async function mcp(host: ExtensionHost) {
   host.onOpen(async () => {
     if (started) return
     started = true
-    for (const server of servers.values()) inBackground(begin(server))
+    for (const server of servers.values())
+      rebuiltOnOpen('open reconnects every configured MCP server', begin(server))
   })
   host.onClose(async () => {
     closed = true
@@ -364,13 +376,19 @@ export default async function mcp(host: ExtensionHost) {
                 return { output: toLlmContent(result), isError: result.isError === true }
               } catch (error) {
                 const brokenConnectionNoResend = !(
+                  rateLimited(error) ||
+                  context.abortSignal?.aborted ||
                   error instanceof McpError ||
                   error instanceof McpTimeoutError ||
                   error instanceof McpAbortError
                 )
                 if (brokenConnectionNoResend && server.client === client)
-                  inBackground(restart(server))
-                return failure(`MCP ${name}/${tool} failed: ${redact(server, error)}`)
+                  rebuiltOnOpen('open reconnects every configured MCP server', restart(server))
+                const known = server.tools.find((entry) => entry.name === tool)
+                return failure(
+                  `MCP ${name}/${tool} failed: ${redact(server, error)}` +
+                    (error instanceof McpError && known ? `\n${schemaOf(known)}` : ''),
+                )
               }
             },
           }),

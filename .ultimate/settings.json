@@ -5,8 +5,8 @@
   "modelFamilies": {
     "families": {
       "lead": { "model": "claude-code/claude-opus-5-5", "thinking": "high", "color": "orange" },
-      "review": { "model": "openai-codex/gpt-6-astra", "thinking": "high" },
-      "fast": { "model": "openai-codex/gpt-6.1-sol" }
+      "review": { "model": "openai-codex/gpt-6.2-astra", "thinking": "high" },
+      "fast": { "model": "openai-codex/gpt-6.2-sol" }
     },
     "assign": {
       "preview": "fast"
@@ -20,10 +20,7 @@
   "lander": {
     "checks": [
       { "command": "pnpm check", "timeout": 120 },
-      [
-        { "command": "pnpm test", "timeout": 180 },
-        { "command": "pnpm test:e2e", "timeout": 180 }
-      ]
+      { "command": "pnpm test:affected", "timeout": 600 }
     ],
     "push": "origin"
   }

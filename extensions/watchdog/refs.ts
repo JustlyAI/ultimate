@@ -9,4 +9,6 @@ export type Failure = {
   step: string
   hint?: string
   retried: boolean
+  /** How many automatic continuations ran before this report, when more than one. */
+  retries?: number
 }

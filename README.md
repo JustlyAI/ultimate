@@ -142,7 +142,8 @@ Supervisor changes require a **manual stop and restart with `pnpm start`**; a co
 
 `ultimate [dir] [--port N] [--no-open]` starts Ultimate for a project (default: the current directory) and opens it
 as its own chromeless window in a Chrome-family browser (`http://ultimate.localhost:<port>`), or a tab when there is
-none. Running it again for a running project opens another window instead. Ultimate's own source stays in the clone;
+none. On macOS, when that origin is installed as a Chrome app, the window opens as that app, with its own Dock and ⌘-Tab
+entry. Running it again for a running project opens another window instead. Ultimate's own source stays in the clone;
 the tools and the conversation work in your project.
 
 - **`.ultimate/` in your project** tailors it: `extensions/`, `agents/`, `skills/`, and an optional `settings.json`
@@ -153,7 +154,7 @@ the tools and the conversation work in your project.
   All project homes are in one central place, `~/.ultimate/projects/`; Ultimate can list other projects and their
   conversations with `ultimate.projects()` in codemode, including their URL when running.
 - **Actions** let an extension's UI call its server code: `export const actions = { … }` in `server.ts`, then
-  `useAction(ref, args)` in `web.tsx`, with a typed `actionRef` from `@/sdk`. See [actions](docs/extensions/actions.md).
+  `useAction(ref, args)` in `web.solid.tsx`, with a typed `actionRef` from `@/sdk/solid`. See [actions](docs/extensions/actions.md).
 
 ### One Ultimate or many
 
@@ -170,7 +171,7 @@ The building blocks that make it possible:
   `{ "<machine>": { "<project>": "<url>" } }` ([Discovery and settings](docs/settings.md)).
 - **Reading:** codemode's `ultimate.conversations`, `entries`, `search`, `trace` and `doc` take `{ project }` and
   read another running instance read-only ([Codemode](extensions/codemode/README.md#other-projects)).
-- **Messaging:** `ultimate.tell({ project, text })` messages another project's @ultimate, and its answer comes back
+- **Messaging:** `tools.tell({ project, text })` messages another project's @ultimate, and its answer comes back
   as a reply ([Messages](extensions/messages/README.md#other-projects-ultimates)).
 - **Watching:** the `status` action reports an instance's health, failures and extensions in one cheap call
   ([Status](extensions/status/README.md)).
@@ -199,7 +200,7 @@ stays docked on every surface, and the choice is durable: reloads, other tabs, a
 - "Build a surface for …" — a whole app with its UI, server actions, and the agent docked beside it; switch to it while
   it is being built.
 - "Build a small extension that …" — it reads [extensions/README.md](extensions/README.md), writes
-  `<project>/.ultimate/extensions/<name>/web.tsx`, and the UI switches to it in front of you.
+  `<project>/.ultimate/extensions/<name>/web.solid.tsx`, and the UI switches to it in front of you.
 - "Take a screenshot of yourself and tell me what looks off" — it can see and drive its own UI.
 - "Delegate to a worker: …" — subagents run as their own conversations (Agents tab, `open #id`).
 - "Use codemode to check which of your extensions failed to load" — one sandboxed script over its own runtime.
@@ -213,7 +214,7 @@ stays docked on every surface, and the choice is durable: reloads, other tabs, a
 ## How it is put together
 
 [AGENTS.md](AGENTS.md) is Ultimate's guide to itself: which path holds what, how each layer reloads, and the
-conventions. Everything that is not core plumbing is an extension folder with a `server.ts` (agent) and/or `web.tsx`
+conventions. Everything that is not core plumbing is an extension folder with a `server.ts` (agent) and/or `web.solid.tsx`
 (UI) facet; [extensions/README.md](extensions/README.md) is the guide to writing them.
 
 ## Develop
