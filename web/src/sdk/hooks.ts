@@ -36,7 +36,7 @@ import type { CommandItem, ExtensionRecord } from './registry.ts'
 import { HOME, panelItems, shownPanels } from './registry.ts'
 import { ROOT } from './api.ts'
 import type { ActionArgs, ActionError } from './api.ts'
-import { api as client, reads, registry, reportCompact, store, uiState } from './client.ts'
+import { api as client, reads, registry, reportCompact, store, uiAgent, uiState } from './client.ts'
 import { events } from './events.ts'
 import { errorMessage } from './format.ts'
 import { restartAccepted, restartPhase, restartTimedOut } from './restart.ts'
@@ -54,6 +54,14 @@ import { subscribeViewport, viewport } from './viewport.ts'
 import type { Viewport } from './viewport.ts'
 
 export { api, bundle, switched } from './client.ts'
+/**
+ * This page's ui-sdk agent bridge (`snapshot`, `query`), with the `act` the browser tool's `ui` steps use, so a label
+ * that exactly names one control acts on it: to run an agent's UI steps on the user's own page.
+ */
+export const pageAgent = () => {
+  const bridge = uiAgent.bridge()
+  return { snapshot: () => bridge.snapshot(), query: bridge.query, act: uiAgent.act }
+}
 /** The page's event bus: `events.emit('secrets:open', { name })`; subscribe for a component's life with `useEvent`. */
 export { events } from './events.ts'
 /**
@@ -78,7 +86,7 @@ export {
   prettyName,
   shortenPath,
 } from './format.ts'
-export { formatKeys, isMac } from './keys.ts'
+export { chordOf, formatKeys, isMac } from './keys.ts'
 /** Whether the device types on a touch keyboard, which focusing an input would slide up over the page. */
 export { touchKeyboard } from './viewport.ts'
 /** The installed link, inline-code and code-block renderers of Markdown, in discovery order (`useExtensions()` records). */
@@ -464,9 +472,12 @@ export const { switchConversation, showSurface, runCommand, openPanel, closePane
 export { uncoveredComposer } from './actions.ts'
 /**
  * `fillComposer(id, text)` replaces conversation `id`'s composer draft, `insertIntoComposer(id, text)` inserts at its
- * cursor.
+ * cursor. `composerDraft(id)` reads the text, images and number of attached files in its composer (`id` may be a `ComposerTarget`'s `draft` key);
+ * `reserve()` marks the draft as being sent, which locks the box and Enter (undefined when a send already holds it),
+ * and returns `release(sent)`: `'all'` or `'images'` removes what was sent unless it changed meanwhile, nothing keeps
+ * it; `subscribe(listener)` hears every change to that draft.
  */
-export { fillComposer, insertIntoComposer } from '../app/drafts.ts'
+export { composerDraft, fillComposer, insertIntoComposer } from '../app/drafts.ts'
 
 /** The conversation `ConversationScope` gives, or the shown one once known. */
 export function useConversationId(): Accessor<ConversationId | undefined> {
@@ -495,8 +506,8 @@ export function useConversationSummary(
 export function useTranscriptElements() {
   const frame = useContext(Transcript)
   return {
-    scroll: () => frame?.scroll.current ?? null,
-    content: () => frame?.content.current ?? null,
+    scroll: () => frame?.elements()?.scroll ?? null,
+    content: () => frame?.elements()?.content ?? null,
   }
 }
 

@@ -370,6 +370,12 @@ it('calls extension actions with caller context and rejects missing or disabled 
     action: { kind: 'action', caller: 'agent', ok: true, args: '{"value":42}' },
     tool: ['tool', 'codemode', [['action', ['action-test/echo']]]],
   })
+  const windowed = await run(
+    server,
+    `const all = await ultimate.trace({ conversation: ${server.root.id} });
+    return await ultimate.trace({ conversation: ${server.root.id}, until: all[0].at });`,
+  )
+  expect(windowed.value).toEqual([])
   const defaults = await run(
     server,
     `return await tools.action({extension: 'action-test', action: 'echo'});`,
@@ -489,16 +495,18 @@ it('applies each automation call in one script to its own arguments', async () =
   servers.push(server)
   const result = await run(
     server,
-    `const created = await tools.automation({action:'create', name:'Probe', schedule:'every 1d'});
-     const id = created.split(' ')[0];
+    `const stored = async () => (await tools.action({extension: 'automations', action: 'list'})).filter((item) => item.name === 'Probe');
+     await tools.automation({action:'create', name:'Probe', schedule:'every 1d'});
+     const [{ id, subscribers: created }] = await stored();
      await tools.automation({action:'subscribe', id, to:'@ultimate'});
      await tools.automation({action:'unsubscribe', id, to:'#${server.root.id}'});
-     const stored = (await tools.action({extension: 'automations', action: 'list'})).find((item) => item.id === id);
-     const lines = (await tools.automation({action:'list'})).split('\\n');
-     return { line: lines.find((line) => line.startsWith(id + ' ')).slice(id.length + 1), subscribers: stored.subscribers };`,
+     const [{ schedule, enabled, subscribers }] = await stored();
+     return { created, schedule, enabled, subscribers };`,
   )
   expect(result.value).toEqual({
-    line: expect.stringMatching(/^Probe — Every 1 day — next: .* — enabled → @ultimate$/),
+    created: [server.root.id],
+    schedule: { kind: 'every', ms: 86_400_000 },
+    enabled: true,
     subscribers: ['@ultimate'],
   })
 })
